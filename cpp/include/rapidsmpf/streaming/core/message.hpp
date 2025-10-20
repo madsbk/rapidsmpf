@@ -27,22 +27,28 @@ namespace rapidsmpf::streaming {
  * another handle that shares the same payload.
  */
 class Message {
-    /**
-     * @brief Internal container for the (shared) payload.
-     */
-    struct Payload {
-        mutable std::mutex mutex;
-        /**
-         * @brief Type-erased holder for the actual payload.
-         *
-         * Stores a `std::shared_ptr<T>` for some `T`.
-         *
-         * @note Conceptually, a `std::unique_ptr` would suffice for exclusive ownership,
-         * but `std::any` requires its contents to be copyable, so a `std::shared_ptr` is
-         * used instead.
-         */
-        std::any data;
-    };
+    // /**
+    //  * @brief Internal container for the (shared) payload.
+    //  */
+    // struct Payload {
+    //     mutable std::mutex mutex;
+    //     /**
+    //      * @brief Type-erased holder for the actual payload.
+    //      *
+    //      * Stores a `std::shared_ptr<T>` for some `T`.
+    //      *
+    //      * @note Conceptually, a `std::unique_ptr` would suffice for exclusive
+    //      ownership,
+    //      * but `std::any` requires its contents to be copyable, so a `std::shared_ptr`
+    //      is
+    //      * used instead.
+    //      */
+    //     std::any data;
+
+    //     template <typename T>
+    //     explicit Payload(std::unique_ptr<T> payload)
+    //         : data{std::make_any<std::unique_ptr<T>>(std::move(payload))} {}
+    // };
 
   public:
     /// @brief Create an empty message.
@@ -62,8 +68,10 @@ class Message {
         RAPIDSMPF_EXPECTS(
             payload != nullptr, "payload cannot be null", std::invalid_argument
         );
-        payload_ = std::make_shared<Payload>();
-        payload_->data = std::shared_ptr<T>(std::move(payload));
+        payload_ = std::shared_ptr<void>(payload.release(), [](void* ptr) {
+            delete static_cast<T*>(ptr);
+        });
+        type_info_ = &typeid(T);
     }
 
     /** @brief Move construct. @param other Source message. */
@@ -80,7 +88,8 @@ class Message {
      * @note After this call, the message is empty.
      */
     void reset() noexcept {
-        return payload_.reset();
+        payload_.reset();
+        type_info_ = nullptr;
     }
 
     /**
@@ -89,11 +98,8 @@ class Message {
      * @return `true` if the message is empty; otherwise, `false`.
      */
     [[nodiscard]] bool empty() const noexcept {
-        if (payload_) {
-            std::lock_guard<std::mutex> lock(payload_->mutex);
-            return !payload_->data.has_value();
-        }
-        return true;
+        // std::lock_guard lock(mtx_);
+        return payload_ == nullptr;
     }
 
     /**
@@ -105,8 +111,8 @@ class Message {
      */
     template <typename T>
     [[nodiscard]] bool holds() const {
-        auto lock = lock_payload();
-        return payload_->data.type() == typeid(std::shared_ptr<T>);
+        RAPIDSMPF_EXPECTS(!empty(), "message is empty", std::invalid_argument);
+        return *type_info_ == typeid(T);
     }
 
     /**
@@ -121,8 +127,11 @@ class Message {
      */
     template <typename T>
     T const& get() const {
-        auto [ret, lock] = get_ptr_and_lock<T>();
-        return *ret;
+        // auto [ret, lock] = get_ptr_and_lock<T>();
+        // return *ret;
+        // auto lock = lock_payload();
+        RAPIDSMPF_EXPECTS(holds<T>(), "wrong message type", std::invalid_argument);
+        return *static_cast<T*>(payload_.get());
     }
 
     /**
@@ -145,17 +154,24 @@ class Message {
     T release() {
         // If this is the last reference, `reset()` deallocates `payload_` thus
         // we have to extract the payload before resetting.
-        auto ret = [&]() -> std::shared_ptr<T> {
-            auto [ptr, lock] = get_ptr_and_lock<T>();
-            RAPIDSMPF_EXPECTS(
-                payload_.use_count() == 1,
-                "release() requires this to be the sole owner of the payload",
-                std::invalid_argument
-            );
-            return std::move(ptr);
-        }();
-        reset();
-        return std::move(*ret);
+        // auto ret = [&]() -> std::shared_ptr<T> {
+        //     auto [ptr, lock] = get_ptr_and_lock<T>();
+        //     RAPIDSMPF_EXPECTS(
+        //         payload_.use_count() == 1,
+        //         "release() requires this to be the sole owner of the payload",
+        //         std::invalid_argument
+        //     );
+        //     return std::move(ptr);
+        // }();
+        RAPIDSMPF_EXPECTS(holds<T>(), "wrong message type", std::invalid_argument);
+        RAPIDSMPF_EXPECTS(
+            payload_.use_count() == 1,
+            "release() requires this to be the sole owner of the payload",
+            std::invalid_argument
+        );
+        auto result = std::move(*std::static_pointer_cast<T>(std::move(payload_)));
+        type_info_ = nullptr;
+        return result;
     }
 
     /**
@@ -166,7 +182,7 @@ class Message {
      * @return A new message that shares the payload with this message.
      */
     [[nodiscard]] Message shallow_copy() const {
-        auto lock = lock_payload();
+        // auto lock = lock_payload();
         return *this;
     }
 
@@ -175,41 +191,44 @@ class Message {
     Message(Message const&) = default;
     Message& operator=(Message const&) = default;
 
-    /**
-     * @brief Lock and validate the internal payload.
-     *
-     * @return A unique lock that guards the payload mutex.
-     * @throws std::invalid_argument if the message is empty.
-     */
-    [[nodiscard]] std::unique_lock<std::mutex> lock_payload() const {
-        if (payload_) {
-            std::unique_lock<std::mutex> lock(payload_->mutex);
-            if (payload_->data.has_value()) {
-                return lock;
-            }
-        }
-        RAPIDSMPF_FAIL("message is empty", std::invalid_argument);
-    }
+    // /**
+    //  * @brief Lock and validate the internal payload.
+    //  *
+    //  * @return A unique lock that guards the payload mutex.
+    //  * @throws std::invalid_argument if the message is empty.
+    //  */
+    // [[nodiscard]] std::unique_lock<std::mutex> lock_payload() const {
+    //     if (payload_) {
+    //         std::unique_lock<std::mutex> lock(mtx_);
+    //         // if (payload_ != nullptr) {
+    //         return lock;
+    //         // }
+    //     }
+    //     RAPIDSMPF_FAIL("message is empty", std::invalid_argument);
+    // }
 
-    /**
-     * @brief Get a shared pointer to the payload of type `T`, with the payload locked.
-     *
-     * @tparam T Payload type.
-     * @return Shared pointer to the payload and its lock.
-     * @throws std::invalid_argument if the message is empty or the type mismatches.
-     */
-    template <typename T>
-    [[nodiscard]] std::pair<std::shared_ptr<T>, std::unique_lock<std::mutex>>
-    get_ptr_and_lock() const {
-        RAPIDSMPF_EXPECTS(holds<T>(), "wrong message type", std::invalid_argument);
-        auto lock = lock_payload();
-        return std::make_pair(
-            std::any_cast<std::shared_ptr<T>>(payload_->data), std::move(lock)
-        );
-    }
+    // /**
+    //  * @brief Get a shared pointer to the payload of type `T`, with the payload locked.
+    //  *
+    //  * @tparam T Payload type.
+    //  * @return Shared pointer to the payload and its lock.
+    //  * @throws std::invalid_argument if the message is empty or the type mismatches.
+    //  */
+    // template <typename T>
+    // [[nodiscard]] std::pair<std::shared_ptr<T>, std::unique_lock<std::mutex>>
+    // get_ptr_and_lock() const {
+    //     RAPIDSMPF_EXPECTS(holds<T>(), "wrong message type", std::invalid_argument);
+    //     auto lock = lock_payload();
+    //     return std::make_pair(
+    //         std::any_cast<std::shared_ptr<T>>(payload_->data), std::move(lock)
+    //     );
+    // }
 
   private:
-    std::shared_ptr<Payload> payload_;
+    // std::shared_ptr<Payload> payload_;
+    // mutable std::mutex mtx_;
+    std::shared_ptr<void> payload_;
+    const std::type_info* type_info_{nullptr};
 };
 
 }  // namespace rapidsmpf::streaming
