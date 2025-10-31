@@ -14,6 +14,7 @@
 #include <utility>
 
 #include <rapidsmpf/buffer/buffer.hpp>
+#include <rapidsmpf/buffer/content_description.hpp>
 #include <rapidsmpf/buffer/resource.hpp>
 #include <rapidsmpf/error.hpp>
 
@@ -32,27 +33,6 @@ class Message {
      * computing data sizes or performing deep copies.
      */
     struct Callbacks {
-        /**
-         * @brief Callback for computing the size of a message's content.
-         *
-         * This callback returns the total size, in bytes, of the data portion associated
-         * with a message. It is used to determine memory requirements for the content
-         * only — not for metadata or any auxiliary information.
-         *
-         * Typically, this data is represented by a `Buffer` that may reside in any
-         * memory type (e.g., host or device). The size reported by this callback
-         * determines how large a memory reservation must be when performing a
-         * `Message::copy()`.
-         *
-         * @param msg Reference to the message whose data size is queried.
-         * @param mem_type Target memory type to query.
-         * @return A pair (size, spillable) where:
-         *   - size: total size (in bytes) of the content for the given memory type.
-         *   - spillable: `true` if the message owns its buffers and releasing it frees
-         *     memory; otherwise `false`.
-         */
-        std::function<std::pair<size_t, bool>(Message const&, MemoryType)> content_size;
-
         /**
          * @brief Callback for performing a deep copy of a message.
          *
@@ -100,9 +80,12 @@ class Message {
     Message(
         std::uint64_t sequence_number,
         std::unique_ptr<T> payload,
+        ContentDescription content_description,
         Callbacks callbacks = Callbacks{}
     )
-        : sequence_number_(sequence_number), callbacks_{std::move(callbacks)} {
+        : sequence_number_(sequence_number),
+          content_description_{content_description},
+          callbacks_{std::move(callbacks)} {
         RAPIDSMPF_EXPECTS(
             payload != nullptr, "nullptr not allowed", std::invalid_argument
         );
@@ -185,6 +168,11 @@ class Message {
         return std::move(*ret);
     }
 
+    [[nodiscard]] constexpr ContentDescription const&
+    content_description() const noexcept {
+        return content_description_;
+    }
+
     /**
      * @brief Returns the callbacks associated with this message.
      *
@@ -217,12 +205,9 @@ class Message {
      * @throws std::invalid_argument if the message does not support `content_size`.
      */
     [[nodiscard]] std::pair<size_t, bool> content_size(MemoryType mem_type) {
-        RAPIDSMPF_EXPECTS(
-            callbacks_.content_size,
-            "message doesn't support `content_size`",
-            std::invalid_argument
+        return std::make_pair(
+            content_description_.content_size(mem_type), content_description_.spillable()
         );
-        return callbacks_.content_size(*this, mem_type);
     }
 
     /**
@@ -236,7 +221,7 @@ class Message {
     [[nodiscard]] size_t copy_cost() {
         size_t ret = 0;
         for (MemoryType mem_type : MEMORY_TYPES) {
-            ret += content_size(mem_type).first;
+            ret += content_description_.content_size(mem_type);
         }
         return ret;
     }
@@ -283,7 +268,13 @@ class Message {
   private:
     std::uint64_t sequence_number_{0};
     std::any payload_;
+    ContentDescription content_description_;
     Callbacks callbacks_;
 };
+
+template <typename T>
+Message non_content_to_message(std::uint64_t sequence_number, std::unique_ptr<T> chunk) {
+    return Message{sequence_number, std::move(chunk), ContentDescription{}};
+}
 
 }  // namespace rapidsmpf::streaming
