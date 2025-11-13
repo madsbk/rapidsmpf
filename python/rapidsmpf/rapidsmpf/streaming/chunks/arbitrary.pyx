@@ -74,6 +74,17 @@ cdef class ArbitraryChunk:
             self._handle.reset()
 
     def release(self):
+        """
+        Release and return the Python payload.
+
+        Returns
+        -------
+        The underlying Python object.
+
+        Warnings
+        --------
+        The ArbitraryChunk is released and must not be used after this call.
+        """
         cdef unique_ptr[cpp_OwningWrapper] obj = self.release_handle()
         cdef object pyobj = <object><PyObject *>(deref(obj).release())
         # Cast to object increfs, so we must decref here
