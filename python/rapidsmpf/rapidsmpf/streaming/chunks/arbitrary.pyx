@@ -65,25 +65,6 @@ cdef class ArbitraryChunk:
         with nogil:
             self._handle.reset()
 
-    @staticmethod
-    cdef ArbitraryChunk from_handle(unique_ptr[cpp_OwningWrapper] handle):
-        """
-        Construct an ArbitraryChunk from an existing C++ handle.
-
-        Parameters
-        ----------
-        handle
-            A unique pointer to a C++ OwningWrapper.
-
-        Returns
-        -------
-        A new ArbitraryChunk wrapping the given handle.
-        """
-
-        cdef ArbitraryChunk ret = ArbitraryChunk.__new__(ArbitraryChunk)
-        ret._handle = move(handle)
-        return ret
-
     def release(self):
         cdef unique_ptr[cpp_OwningWrapper] obj = self.release_handle()
         cdef object pyobj = <object><PyObject *>(deref(obj).release())
@@ -106,11 +87,11 @@ cdef class ArbitraryChunk:
         -------
         A new ArbitraryChunk extracted from the given message.
         """
-        return ArbitraryChunk.from_handle(
-            make_unique[cpp_OwningWrapper](
-                message._handle.release[cpp_OwningWrapper]()
-            )
+        cdef ArbitraryChunk ret = ArbitraryChunk.__new__(ArbitraryChunk)
+        ret._handle = make_unique[cpp_OwningWrapper](
+            message._handle.release[cpp_OwningWrapper]()
         )
+        return ret
 
     def into_message(self, uint64_t sequence_number, Message message not None):
         """
@@ -141,23 +122,6 @@ cdef class ArbitraryChunk:
         message._handle = cpp_to_message(
             sequence_number, move(self.release_handle())
         )
-
-    cdef const cpp_OwningWrapper* handle_ptr(self):
-        """
-        Return a pointer to the underlying C++ OwningWrapper.
-
-        Returns
-        -------
-        Raw pointer to the underlying C++ object.
-
-        Raises
-        ------
-        ValueError
-            If the ArbitraryChunk is uninitialized.
-        """
-        if not self._handle:
-            raise ValueError("is uninitialized, has it been released?")
-        return self._handle.get()
 
     cdef unique_ptr[cpp_OwningWrapper] release_handle(self):
         """
