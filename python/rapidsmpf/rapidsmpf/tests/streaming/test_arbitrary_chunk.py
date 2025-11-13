@@ -6,6 +6,8 @@ from __future__ import annotations
 import weakref
 from typing import TYPE_CHECKING
 
+from rapidsmpf.buffer.buffer import MemoryType
+from rapidsmpf.buffer.content_description import ContentDescription
 from rapidsmpf.streaming.chunks.arbitrary import ArbitraryChunk
 from rapidsmpf.streaming.core.leaf_node import pull_from_channel, push_to_channel
 from rapidsmpf.streaming.core.message import Message
@@ -34,6 +36,17 @@ def test_roundtrip_chunk(context: Context) -> None:
 def test_roundtrip_message() -> None:
     expect = Object(10)
     got = ArbitraryChunk.from_message(Message(1, ArbitraryChunk(expect))).release()
+    assert got is expect
+
+
+def test_content_description() -> None:
+    expect = Object(10)
+    cd = ContentDescription(
+        content_sizes={MemoryType.DEVICE: 1, MemoryType.HOST: 2}, spillable=False
+    )
+    msg = Message(1, ArbitraryChunk(expect, cd))
+    assert msg.get_content_description() == cd
+    got = ArbitraryChunk.from_message(msg).release()
     assert got is expect
 
 

@@ -49,6 +49,6 @@ cdef extern from * nogil:
 cdef cpp_ContentDescription content_description_to_cpp(object cd):
     assert isinstance(cd, ContentDescription)
     cdef cpp_ContentDescription ret = cpp_content_description_new(cd.spillable)
-    for mem_type, size in cd.content_sizes:
+    for mem_type, size in cd.content_sizes.items():
         cpp_content_description_set_size(ret, mem_type, size)
     return ret

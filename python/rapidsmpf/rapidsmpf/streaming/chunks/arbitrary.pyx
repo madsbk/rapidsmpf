@@ -8,8 +8,12 @@ from libc.stdint cimport uint64_t
 from libcpp.memory cimport make_unique, unique_ptr
 from libcpp.utility cimport move
 
+from rapidsmpf.buffer.content_description cimport (content_description_to_cpp,
+                                                   cpp_ContentDescription)
 from rapidsmpf.streaming.chunks.utils cimport py_deleter
 from rapidsmpf.streaming.core.message cimport Message, cpp_Message
+
+from rapidsmpf.buffer.content_description import ContentDescription
 
 
 cdef extern from * nogil:
@@ -17,21 +21,19 @@ cdef extern from * nogil:
     namespace {
     rapidsmpf::streaming::Message cpp_to_message(
         std::uint64_t sequence_number,
-        std::unique_ptr<rapidsmpf::streaming::OwningWrapper> obj
+        std::unique_ptr<rapidsmpf::streaming::OwningWrapper> obj,
+        rapidsmpf::ContentDescription cd
     ) {
         return rapidsmpf::streaming::Message{
             sequence_number,
             std::move(obj),
-            // TODO: support content description in Python. For now, we use
-            // an empty content description and provide no copy callback. This
-            // means that ArbitraryChunk won't support copy or spilling.
-            rapidsmpf::ContentDescription{}
+            cd
         };
     }
     }
     """
     cpp_Message cpp_to_message(
-        uint64_t, unique_ptr[cpp_OwningWrapper]
+        uint64_t, unique_ptr[cpp_OwningWrapper], cpp_ContentDescription
     ) except +
 
 
@@ -51,11 +53,17 @@ cdef class ArbitraryChunk:
     drop the chunk in C++: deallocation will acquire the gil and decref the
     stored object.
     """
-    def __init__(self, object obj):
+    def __init__(self, object obj, content_description = None):
         Py_INCREF(obj)
         self._handle = make_unique[cpp_OwningWrapper](
             <void *><PyObject *>obj, py_deleter
         )
+        if content_description is None:
+            self._content_description = ContentDescription(
+                content_sizes={}, spillable=False
+            )
+        else:
+            self._content_description = content_description
 
     @classmethod
     def __class_getitem__(cls, args):
@@ -71,6 +79,17 @@ cdef class ArbitraryChunk:
         # Cast to object increfs, so we must decref here
         Py_DECREF(pyobj)
         return pyobj
+
+    @property
+    def content_description(self):
+        """
+        Return the associated content description.
+
+        Returns
+        -------
+        content description of this the chunk.
+        """
+        return self._content_description
 
     @staticmethod
     def from_message(Message message not None):
@@ -91,6 +110,7 @@ cdef class ArbitraryChunk:
         ret._handle = make_unique[cpp_OwningWrapper](
             message._handle.release[cpp_OwningWrapper]()
         )
+        ret._content_description = message.get_content_description()
         return ret
 
     def into_message(self, uint64_t sequence_number, Message message not None):
@@ -120,7 +140,9 @@ cdef class ArbitraryChunk:
         if not message.empty():
             raise ValueError("cannot move into a non-empty message")
         message._handle = cpp_to_message(
-            sequence_number, move(self.release_handle())
+            sequence_number,
+            move(self.release_handle()),
+            content_description_to_cpp(self._content_description)
         )
 
     cdef unique_ptr[cpp_OwningWrapper] release_handle(self):

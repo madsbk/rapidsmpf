@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Generic, Self, TypeVar
 
+from rapidsmpf.buffer.content_description import ContentDescription
 from rapidsmpf.streaming.core.message import Message, Payload
 
 T = TypeVar("T")
 
 class ArbitraryChunk(Generic[T]):
-    def __init__(self, obj: T) -> None: ...
+    def __init__(self, obj: T, content_description: ContentDescription) -> None: ...
     def release(self) -> T: ...
     @classmethod
     def from_message(cls: type[Self], message: Message[Self]) -> Self: ...
