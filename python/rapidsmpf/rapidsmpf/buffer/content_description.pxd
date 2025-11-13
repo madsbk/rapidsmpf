@@ -14,3 +14,4 @@ cdef extern from "<rapidsmpf/buffer/content_description.hpp>" nogil:
 
 
 cdef content_description_from_cpp(cpp_ContentDescription cd)
+cdef cpp_ContentDescription content_description_to_cpp(object cd)
