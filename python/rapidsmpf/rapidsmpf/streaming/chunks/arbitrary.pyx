@@ -87,8 +87,7 @@ cdef class ArbitraryChunk:
         """
         cdef unique_ptr[cpp_OwningWrapper] obj = self.release_handle()
         cdef object pyobj = <object><PyObject *>(deref(obj).release())
-        # Cast to object increfs, so we must decref here
-        Py_DECREF(pyobj)
+        Py_DECREF(pyobj)  # Cast to object increfs, so we must decref here
         return pyobj
 
     @property
@@ -117,12 +116,12 @@ cdef class ArbitraryChunk:
         -------
         A new ArbitraryChunk extracted from the given message.
         """
-        cdef ArbitraryChunk ret = ArbitraryChunk.__new__(ArbitraryChunk)
-        ret._handle = make_unique[cpp_OwningWrapper](
-            message._handle.release[cpp_OwningWrapper]()
-        )
-        ret._content_description = message.get_content_description()
-        return ret
+        cd = message.get_content_description()
+        cdef object obj = <object><PyObject *>message._handle.release[
+            cpp_OwningWrapper
+        ]().release()
+        Py_DECREF(obj)  # Cast to object increfs, so we must decref here
+        return ArbitraryChunk(obj, cd)
 
     def into_message(self, uint64_t sequence_number, Message message not None):
         """
