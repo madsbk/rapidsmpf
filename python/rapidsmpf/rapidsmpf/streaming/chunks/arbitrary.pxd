@@ -11,7 +11,5 @@ cdef extern from "<rapidsmpf/streaming/cudf/owning_wrapper.hpp>" nogil:
 
 
 cdef class ArbitraryChunk:
-    cdef unique_ptr[cpp_OwningWrapper] _handle
+    cdef object _obj
     cdef object _content_description
-
-    cdef unique_ptr[cpp_OwningWrapper] release_handle(self)

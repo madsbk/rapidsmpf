@@ -3,10 +3,8 @@
 
 from cpython.object cimport PyObject
 from cpython.ref cimport Py_DECREF, Py_INCREF
-from cython.operator cimport dereference as deref
 from libc.stdint cimport uint64_t
 from libcpp.memory cimport make_unique, unique_ptr
-from libcpp.utility cimport move
 
 from rapidsmpf.buffer.content_description cimport (content_description_to_cpp,
                                                    cpp_ContentDescription)
@@ -54,24 +52,16 @@ cdef class ArbitraryChunk:
     stored object.
     """
     def __init__(self, object obj, content_description = None):
-        Py_INCREF(obj)
-        self._handle = make_unique[cpp_OwningWrapper](
-            <void *><PyObject *>obj, py_deleter
-        )
-        if content_description is None:
+        self._obj = obj
+        self._content_description = content_description
+        if self._content_description is None:
             self._content_description = ContentDescription(
                 content_sizes={}, spillable=False
             )
-        else:
-            self._content_description = content_description
 
     @classmethod
     def __class_getitem__(cls, args):
         return cls
-
-    def __dealloc__(self):
-        with nogil:
-            self._handle.reset()
 
     def release(self):
         """
@@ -81,14 +71,19 @@ cdef class ArbitraryChunk:
         -------
         The underlying Python object.
 
+        Raises
+        ------
+        ValueError
+            If the chunk has already been released.
+
         Warnings
         --------
         The ArbitraryChunk is released and must not be used after this call.
         """
-        cdef unique_ptr[cpp_OwningWrapper] obj = self.release_handle()
-        cdef object pyobj = <object><PyObject *>(deref(obj).release())
-        Py_DECREF(pyobj)  # Cast to object increfs, so we must decref here
-        return pyobj
+        if self._obj is None:
+            raise ValueError("Chunk is uninitialized, has it already been released?")
+        self._obj, ret = None, self._obj
+        return ret
 
     @property
     def content_description(self):
@@ -116,6 +111,7 @@ cdef class ArbitraryChunk:
         -------
         A new ArbitraryChunk extracted from the given message.
         """
+        # Extract the payload from message and create a new chunk wrapping it.
         cd = message.get_content_description()
         cdef object obj = <object><PyObject *>message._handle.release[
             cpp_OwningWrapper
@@ -149,28 +145,13 @@ cdef class ArbitraryChunk:
         """
         if not message.empty():
             raise ValueError("cannot move into a non-empty message")
+
+        obj = self.release()
+        Py_INCREF(obj)
         message._handle = cpp_to_message(
             sequence_number,
-            move(self.release_handle()),
+            make_unique[cpp_OwningWrapper](
+                <void *><PyObject *>obj, py_deleter
+            ),
             content_description_to_cpp(self._content_description)
         )
-
-    cdef unique_ptr[cpp_OwningWrapper] release_handle(self):
-        """
-        Release ownership of the underlying C++ OwningWrapper.
-
-        After this call, the current object is in a moved-from state and
-        must not be accessed.
-
-        Returns
-        -------
-        Unique pointer to the underlying C++ object.
-
-        Raises
-        ------
-        ValueError
-            If the OwningWrapperChunk is uninitialized.
-        """
-        if not self._handle:
-            raise ValueError("is uninitialized, has it been released?")
-        return move(self._handle)
