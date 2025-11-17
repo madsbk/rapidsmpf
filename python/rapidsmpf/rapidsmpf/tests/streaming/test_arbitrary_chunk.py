@@ -50,6 +50,22 @@ def test_content_description() -> None:
     assert got is expect
 
 
+def test_copy_cb(context: Context) -> None:
+    expect = Object(10)
+    cd = ContentDescription(
+        content_sizes={MemoryType.DEVICE: 1, MemoryType.HOST: 2}, spillable=False
+    )
+    msg = Message(1, ArbitraryChunk(expect, cd))
+    assert msg.get_content_description() == cd
+
+    res = context.br().reserve_and_spill(
+        MemoryType.DEVICE, msg.copy_cost(), allow_overbooking=False
+    )
+    msg.copy(res)
+    got = ArbitraryChunk.from_message(msg).release()
+    assert got is expect
+
+
 def test_gc_in_chunk() -> None:
     obj = Object(10)
     finalizer = weakref.finalize(obj, lambda: None)
