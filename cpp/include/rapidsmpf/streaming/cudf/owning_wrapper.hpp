@@ -56,6 +56,15 @@ class OwningWrapper {
         : obj_{owning_type(obj, deleter)} {}
 
     /**
+     * @brief Get the underlying pointer (const).
+     *
+     * @return Pointer to object.
+     */
+    [[nodiscard]] void const* get() const noexcept {
+        return obj_.get();
+    }
+
+    /**
      * @brief Release ownership of the underlying pointer
      *
      * @return Pointer to object.
