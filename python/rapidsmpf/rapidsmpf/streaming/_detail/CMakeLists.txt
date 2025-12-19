@@ -5,8 +5,10 @@
 # cmake-format: on
 # =================================================================================
 
-add_subdirectory(_detail)
-add_subdirectory(chunks)
-add_subdirectory(coll)
-add_subdirectory(core)
-add_subdirectory(cudf)
+set(cython_modules libcoro_spawn_task.pyx)
+
+rapids_cython_create_modules(
+  CXX
+  SOURCE_FILES "${cython_modules}"
+  LINKED_LIBRARIES rapidsmpf::rapidsmpf maybe_asan
+)
