@@ -210,6 +210,31 @@ target_link_libraries(
 )
 disable_sign_conversion_warning(rrun_tests)
 
+# hardware_binding_tests - Tests for rapidsmpf::apply_hardware_bindings API. Must be run with rrun
+# so that CUDA_VISIBLE_DEVICES is set. Example: rrun -n 1 gtests/hardware_binding_tests
+add_executable(hardware_binding_tests main/rrun.cpp test_hardware_binding.cpp)
+set_target_properties(
+  hardware_binding_tests
+  PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<BUILD_INTERFACE:${RAPIDSMPF_BINARY_DIR}/gtests>"
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             # For std:: support of __int128_t. Can be removed once using cuda::std
+             CXX_EXTENSIONS ON
+             CUDA_STANDARD 20
+             CUDA_STANDARD_REQUIRED ON
+             COMPONENT testing # custom test property, so that this could be searched later
+)
+target_compile_options(
+  hardware_binding_tests PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${RAPIDSMPF_CXX_FLAGS}>"
+                                 "$<$<COMPILE_LANGUAGE:CUDA>:${RAPIDSMPF_CUDA_FLAGS}>"
+)
+target_link_libraries(
+  hardware_binding_tests
+  PRIVATE rapidsmpf::rapidsmpf cuCascade::cucascade GTest::gmock GTest::gtest
+          $<TARGET_NAME_IF_EXISTS:conda_env> maybe_asan $<$<BOOL:${RAPIDSMPF_HAVE_NUMA}>:numa>
+)
+disable_sign_conversion_warning(hardware_binding_tests)
+
 add_executable(single_tests main/single.cpp)
 
 set_target_properties(

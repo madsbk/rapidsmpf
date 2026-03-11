@@ -213,6 +213,7 @@ add_library(
   src/statistics.cpp
   src/stream_ordered_timing.cpp
   src/system_info.cpp
+  src/utils/hardware_binding.cpp
   src/utils/misc.cpp
   src/utils/string.cpp
 )

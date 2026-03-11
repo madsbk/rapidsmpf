@@ -5,7 +5,7 @@
 # cmake-format: on
 # =================================================================================
 
-set(cython_modules system_info.pyx time.pyx)
+set(cython_modules system_info.pyx time.pyx hardware_binding.pyx)
 
 rapids_cython_create_modules(
   CXX
