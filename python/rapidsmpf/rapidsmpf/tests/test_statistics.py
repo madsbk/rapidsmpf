@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import pathlib
+import pickle
 from typing import TYPE_CHECKING
 
 import pytest
 
 from rapidsmpf.rmm_resource_adaptor import RmmResourceAdaptor
-from rapidsmpf.statistics import Statistics
+from rapidsmpf.statistics import Formatter, Statistics
 
 if TYPE_CHECKING:
     import rmm.mr
@@ -236,3 +237,69 @@ def test_merge_empty() -> None:
 
     merged = a.merge([])
     assert merged.get_stat("x") == a.get_stat("x")
+
+
+def test_add_report_entry_bytes() -> None:
+    stats = Statistics(enable=True)
+    stats.add_stat("payload", 1024.0)
+    stats.add_report_entry("payload", ["payload"], Formatter.Bytes)
+    assert "1 KiB" in stats.report()
+
+
+def test_add_report_entry_memcopy() -> None:
+    stats = Statistics(enable=True)
+    stats.add_stat("copy-bytes", 1024 * 1024)
+    stats.add_stat("copy-time", 0.002)
+    stats.add_stat("copy-delay", 0.00001)
+    stats.add_report_entry(
+        "copy", ["copy-bytes", "copy-time", "copy-delay"], Formatter.MemCopy
+    )
+    assert "1 MiB" in stats.report()
+
+
+def test_json_has_no_formatter_info() -> None:
+    stats = Statistics(enable=True)
+    stats.add_stat("alpha", 1024.0)
+    stats.add_report_entry("alpha", ["alpha"], Formatter.Bytes)
+
+    data = json.loads(stats.write_json_string())
+    # JSON carries numeric data only — no formatter/report-entry metadata.
+    assert "report_entries" not in data
+    assert "formatter" not in data
+
+
+def test_pickle_roundtrip() -> None:
+    stats = Statistics(enable=True)
+    stats.add_stat("payload", 2048.0)
+    stats.add_report_entry("payload", ["payload"], Formatter.Bytes)
+    stats.add_stat("plain", 7.0)
+    stats.add_report_entry(
+        "copy",
+        ["copy-bytes", "copy-time", "copy-delay"],
+        Formatter.MemCopy,
+    )
+    stats.add_stat("copy-bytes", 1024 * 1024)
+    stats.add_stat("copy-time", 0.002)
+    stats.add_stat("copy-delay", 0.00001)
+
+    unpickled = pickle.loads(pickle.dumps(stats))
+    assert isinstance(unpickled, Statistics)
+    # Stats round-trip numerically.
+    assert unpickled.get_stat("payload") == stats.get_stat("payload")
+    assert unpickled.get_stat("plain") == stats.get_stat("plain")
+    # Formatter metadata round-trips — the report is identical.
+    assert unpickled.report() == stats.report()
+
+
+def test_pickle_empty() -> None:
+    stats = Statistics(enable=True)
+    unpickled = pickle.loads(pickle.dumps(stats))
+    assert unpickled.enabled
+    assert unpickled.list_stat_names() == []
+
+
+def test_pickle_preserves_disabled_flag() -> None:
+    stats = Statistics(enable=False)
+    assert not stats.enabled
+    unpickled = pickle.loads(pickle.dumps(stats))
+    assert not unpickled.enabled

@@ -20,6 +20,7 @@
 
 #include <rapidsmpf/cuda_stream.hpp>
 #include <rapidsmpf/memory/memory_type.hpp>
+#include <rapidsmpf/statistics.hpp>
 #include <rapidsmpf/streaming/core/actor.hpp>
 #include <rapidsmpf/streaming/core/channel.hpp>
 #include <rapidsmpf/streaming/core/coro_utils.hpp>
@@ -106,12 +107,13 @@ class FileCache {
     std::optional<Message> get(std::shared_ptr<Context> ctx, Key const& key) const {
         auto& stats = *ctx->statistics();
 
-        stats.register_formatter(
-            "unbounded_file_read_cache hits",
-            [](std::ostream& os, std::vector<rapidsmpf::Statistics::Stat> const& s) {
-                os << s[0].value() << "/" << s[0].count() << " (hits/lookups)";
-            }
-        );
+        if (!stats.has_report_entry("unbounded_file_read_cache hits")) {
+            stats.add_report_entry(
+                "unbounded_file_read_cache hits",
+                {"unbounded_file_read_cache hits"},
+                Statistics::Formatter::HitRate
+            );
+        }
 
         SpillableMessages::MessageId mid;
         {

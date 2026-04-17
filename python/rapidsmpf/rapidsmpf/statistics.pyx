@@ -1,8 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 
+from cpython.bytes cimport PyBytes_FromStringAndSize
 from cython.operator cimport dereference as deref
 from cython.operator cimport preincrement
+from libc.stdint cimport uint8_t
+from libc.string cimport memcpy
 from libcpp cimport bool as bool_t
 from libcpp.memory cimport make_shared, make_unique, shared_ptr
 from libcpp.string cimport string
@@ -65,6 +68,14 @@ cdef extern from *:
         stats.write_json(ss);
         return ss.str();
     }
+    // Wrap the span-based Statistics::deserialize so Cython can pass a vector.
+    std::shared_ptr<rapidsmpf::Statistics> cpp_deserialize_statistics(
+        std::vector<std::uint8_t> const& v
+    ) {
+        return rapidsmpf::Statistics::deserialize(
+            std::span<std::uint8_t const>(v.data(), v.size())
+        );
+    }
     """
     size_t cpp_get_statistic_count(cpp_Statistics stats, string name) \
         except +ex_handler nogil
@@ -77,6 +88,9 @@ cdef extern from *:
     void cpp_write_json(cpp_Statistics stats, string filepath) \
         except +ex_handler nogil
     string cpp_write_json_string(cpp_Statistics stats) except +ex_handler nogil
+    shared_ptr[cpp_Statistics] cpp_deserialize_statistics(
+        const vector[uint8_t]& v
+    ) except +ex_handler nogil
 
 cdef class Statistics:
     """
@@ -227,6 +241,33 @@ cdef class Statistics:
         cdef string name_ = str.encode(name)
         with nogil:
             deref(self._handle).add_stat(name_, value)
+
+    def add_report_entry(self, name, stat_names, Formatter formatter):
+        """
+        Associate a predefined formatter with one or more stat names.
+
+        Mirrors the C++ ``rapidsmpf::Statistics::add_report_entry``.
+        First-wins: if a report entry already exists under ``name``, this
+        call has no effect.
+
+        Parameters
+        ----------
+        name
+            Report entry name. Becomes one line in :meth:`report`.
+        stat_names
+            Iterable of stat names this entry aggregates. The number of
+            names must match the arity of ``formatter``.
+        formatter
+            A `Formatter` selecting the predefined render function.
+        """
+        cdef string name_ = str.encode(name)
+        cdef vector[string] cpp_stat_names
+        for sn in stat_names:
+            cpp_stat_names.push_back(str.encode(sn))
+        with nogil:
+            deref(self._handle).add_report_entry(
+                name_, cpp_stat_names, formatter
+            )
 
     @property
     def memory_profiling_enabled(self):
@@ -393,6 +434,32 @@ cdef class Statistics:
         with nogil:
             result = cpp_write_json_string(deref(self._handle))
         return result.decode("utf-8")
+
+    def __getstate__(self):
+        """Serialize stats and report entries for pickling.
+
+        Memory records and the memory-profiling resource pointer are not
+        included — matching the C++ ``Statistics::serialize()`` contract.
+        """
+        cdef vector[uint8_t] vec
+        with nogil:
+            vec = deref(self._handle).serialize()
+        return <bytes>PyBytes_FromStringAndSize(
+            <const char*>vec.data() if not vec.empty() else NULL,
+            vec.size()
+        )
+
+    def __setstate__(self, bytes state not None):
+        """Restore stats and report entries from a pickled bytes buffer."""
+        cdef Py_ssize_t size = len(state)
+        cdef const char* src = <const char*>state
+        cdef vector[uint8_t] vec
+        with nogil:
+            vec.resize(size)
+            memcpy(<void*>vec.data(), src, size)
+            self._handle = cpp_deserialize_statistics(vec)
+        # Memory-profiling state is not serialized.
+        self._mr = None
 
 
 @dataclass

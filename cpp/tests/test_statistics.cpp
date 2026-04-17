@@ -52,22 +52,28 @@ TEST_F(StatisticsTest, Communication) {
 
     EXPECT_THROW(stats.get_stat("unknown-name"), std::out_of_range);
 
-    auto custom_formatter = [](std::ostream& os,
-                               std::vector<rapidsmpf::Statistics::Stat> const& s) {
-        os << s[0].value() << " by custom formatter";
-    };
-
-    stats.register_formatter("custom-formatter", custom_formatter);
-    stats.add_stat("custom-formatter", 10);
-    stats.add_stat("custom-formatter", 1);
-    EXPECT_EQ(stats.get_stat("custom-formatter").count(), 2);
-    EXPECT_EQ(stats.get_stat("custom-formatter").value(), 11);
-    EXPECT_THAT(stats.report(), ::testing::HasSubstr("custom-formatter"));
-    EXPECT_THAT(stats.report(), ::testing::HasSubstr("11 by custom formatter"));
+    // Default-formatted stat (no report entry needed).
+    stats.add_stat("plain-stat", 10);
+    stats.add_stat("plain-stat", 1);
+    EXPECT_EQ(stats.get_stat("plain-stat").count(), 2);
+    EXPECT_EQ(stats.get_stat("plain-stat").value(), 11);
+    EXPECT_THAT(stats.report(), ::testing::HasSubstr("plain-stat"));
+    EXPECT_THAT(stats.report(), ::testing::HasSubstr("11 (count 2)"));
 
     stats.add_bytes_stat("byte-statistics", 20);
     EXPECT_THAT(stats.report(), ::testing::HasSubstr("byte-statistics"));
     EXPECT_THAT(stats.report(), ::testing::HasSubstr("20 B"));
+}
+
+TEST_F(StatisticsTest, AddReportEntryArityMismatchThrowsOnRender) {
+    rapidsmpf::Statistics stats;
+    // MemCopy expects 3 stats; passing one is accepted at registration but
+    // fails when report() tries to render the entry.
+    stats.add_report_entry(
+        "bad", {"only-one"}, rapidsmpf::Statistics::Formatter::MemCopy
+    );
+    stats.add_stat("only-one", 1.0);
+    EXPECT_THROW(std::ignore = stats.report(), std::out_of_range);
 }
 
 TEST_F(StatisticsTest, StatMax) {
@@ -84,81 +90,51 @@ TEST_F(StatisticsTest, StatMax) {
     EXPECT_EQ(s.max(), 10.0);  // max stays at 10
 }
 
-TEST_F(StatisticsTest, ExistReportEntryName) {
+TEST_F(StatisticsTest, AddReportEntryFirstWins) {
     rapidsmpf::Statistics stats;
-
-    // Unknown name returns false.
-    EXPECT_FALSE(stats.exist_report_entry_name("foo"));
-
-    // Returns true after registration.
-    stats.register_formatter(
-        "foo", [](std::ostream& os, std::vector<rapidsmpf::Statistics::Stat> const& s) {
-            os << s[0].value();
-        }
+    // The first add_report_entry wins: a Default (count-aware) entry stays
+    // in place even after add_bytes_stat tries to upgrade it to Bytes.
+    stats.add_report_entry(
+        "my-bytes", {"my-bytes"}, rapidsmpf::Statistics::Formatter::Default
     );
-    EXPECT_TRUE(stats.exist_report_entry_name("foo"));
-
-    // Unrelated name is still absent.
-    EXPECT_FALSE(stats.exist_report_entry_name("bar"));
-
-    // Disabled statistics always returns false (no formatters are ever registered).
-    rapidsmpf::Statistics disabled(false);
-    disabled.register_formatter(
-        "foo", [](std::ostream& os, std::vector<rapidsmpf::Statistics::Stat> const& s) {
-            os << s[0].value();
-        }
-    );
-    EXPECT_FALSE(disabled.exist_report_entry_name("foo"));
-}
-
-TEST_F(StatisticsTest, RegisterFormatterFirstWins) {
-    rapidsmpf::Statistics stats;
-    // Register a custom formatter first.
-    stats.register_formatter(
-        "my-bytes",
-        [](std::ostream& os, std::vector<rapidsmpf::Statistics::Stat> const& s) {
-            os << "custom:" << s[0].value();
-        }
-    );
-    // add_bytes_stat tries to register a bytes formatter, but the custom one takes
-    // precedence because the first registered formatter is always used.
     stats.add_bytes_stat("my-bytes", 1024);
-    EXPECT_THAT(stats.report(), ::testing::HasSubstr("custom:1024"));
+    EXPECT_THAT(stats.report(), ::testing::HasSubstr("my-bytes"));
+    EXPECT_THAT(stats.report(), ::testing::HasSubstr("1024"));
     EXPECT_THAT(stats.report(), ::testing::Not(::testing::HasSubstr("KiB")));
 }
 
-TEST_F(StatisticsTest, MultiStatFormatter) {
+TEST_F(StatisticsTest, MultiStatReportEntry) {
     rapidsmpf::Statistics stats;
-    stats.register_formatter(
-        "spill-summary",
-        {"spill-bytes", "spill-time"},
-        [](std::ostream& os, std::vector<rapidsmpf::Statistics::Stat> const& s) {
-            os << format_nbytes(s[0].value()) << " in " << format_duration(s[1].value());
-        }
+    // Build a MemCopy-style 3-stat report entry.
+    stats.add_report_entry(
+        "copy-summary",
+        {"copy-summary-bytes", "copy-summary-time", "copy-summary-stream-delay"},
+        rapidsmpf::Statistics::Formatter::MemCopy
     );
-    stats.add_stat("spill-bytes", 1024 * 1024);
-    stats.add_stat("spill-time", 0.001);
-    EXPECT_THAT(stats.report(), ::testing::HasSubstr("spill-summary"));
+    stats.add_stat("copy-summary-bytes", 1024 * 1024);
+    stats.add_stat("copy-summary-time", 0.001);
+    stats.add_stat("copy-summary-stream-delay", 0.0001);
+    EXPECT_THAT(stats.report(), ::testing::HasSubstr("copy-summary"));
     EXPECT_THAT(stats.report(), ::testing::HasSubstr("1 MiB"));
-    // The component stats should not appear as individual report entries.
-    EXPECT_THAT(stats.report(), ::testing::Not(::testing::HasSubstr("spill-bytes")));
-    EXPECT_THAT(stats.report(), ::testing::Not(::testing::HasSubstr("spill-time")));
+    // Component stats are consumed by the report entry and don't emit
+    // their own lines.
+    EXPECT_THAT(
+        stats.report(), ::testing::Not(::testing::HasSubstr("copy-summary-bytes:"))
+    );
 }
 
 TEST_F(StatisticsTest, ReportNoDataCollected) {
     rapidsmpf::Statistics stats;
-    stats.register_formatter(
+    stats.add_report_entry(
         "spill-summary",
-        {"spill-bytes", "spill-time"},
-        [](std::ostream& os, std::vector<rapidsmpf::Statistics::Stat> const& s) {
-            os << format_nbytes(s[0].value()) << " in " << format_duration(s[1].value());
-        }
+        {"spill-bytes", "spill-time", "spill-delay"},
+        rapidsmpf::Statistics::Formatter::MemCopy
     );
-    // No stats recorded — formatter should still appear with "No data collected".
+    // No stats recorded — entry should still appear with "No data collected".
     EXPECT_THAT(stats.report(), ::testing::HasSubstr("spill-summary"));
     EXPECT_THAT(stats.report(), ::testing::HasSubstr("No data collected"));
 
-    // Adding only one of the two required stats still yields "No data collected".
+    // Adding only one of the three required stats still yields "No data collected".
     stats.add_stat("spill-bytes", 1024 * 1024);
     EXPECT_THAT(stats.report(), ::testing::HasSubstr("No data collected"));
     EXPECT_THAT(stats.report(), ::testing::HasSubstr("spill-bytes"));  // uncovered
@@ -167,28 +143,20 @@ TEST_F(StatisticsTest, ReportNoDataCollected) {
 TEST_F(StatisticsTest, ReportSorting) {
     rapidsmpf::Statistics stats;
 
-    // Register formatter entries for "banana" and "cherry".
-    stats.register_formatter(
-        "banana",
-        [](std::ostream& os, std::vector<rapidsmpf::Statistics::Stat> const& s) {
-            os << s[0].value();
-        }
-    );
     stats.add_stat("banana", 2);
-
-    stats.register_formatter(
-        "cherry",
-        [](std::ostream& os, std::vector<rapidsmpf::Statistics::Stat> const& s) {
-            os << s[0].value();
-        }
+    stats.add_report_entry(
+        "banana", {"banana"}, rapidsmpf::Statistics::Formatter::Default
     );
-    stats.add_stat("cherry", 3);
 
-    // Add uncovered raw stats for "apple" and "date".
+    stats.add_stat("cherry", 3);
+    stats.add_report_entry(
+        "cherry", {"cherry"}, rapidsmpf::Statistics::Formatter::Default
+    );
+
+    // Uncovered raw stats for "apple" and "date".
     stats.add_stat("apple", 1);
     stats.add_stat("date", 4);
 
-    // All four entries must appear.
     auto const r = stats.report();
     auto const pos_apple = r.find("apple");
     auto const pos_banana = r.find("banana");
@@ -200,7 +168,6 @@ TEST_F(StatisticsTest, ReportSorting) {
     ASSERT_NE(pos_cherry, std::string::npos);
     ASSERT_NE(pos_date, std::string::npos);
 
-    // They must appear in alphabetical order.
     EXPECT_LT(pos_apple, pos_banana);
     EXPECT_LT(pos_banana, pos_cherry);
     EXPECT_LT(pos_cherry, pos_date);
@@ -367,6 +334,9 @@ TEST_F(StatisticsTest, JsonStream) {
     EXPECT_THAT(s, ::testing::HasSubstr(R"("max": 10)"));
     EXPECT_THAT(s, ::testing::HasSubstr(R"("bar")"));
     EXPECT_THAT(s, ::testing::Not(::testing::HasSubstr("memory_records")));
+    // JSON carries numeric data only — no formatter/report-entry metadata.
+    EXPECT_THAT(s, ::testing::Not(::testing::HasSubstr("report_entries")));
+    EXPECT_THAT(s, ::testing::Not(::testing::HasSubstr("formatter")));
 }
 
 TEST_F(StatisticsTest, InvalidStatNames) {
@@ -464,26 +434,89 @@ TEST_F(StatisticsTest, SerializeMalformed) {
         std::ignore = rapidsmpf::Statistics::deserialize(empty), std::invalid_argument
     );
 
-    // Truncated: just one byte, not enough for num_stats.
+    // Truncated: just one byte, not enough for the num_stats field.
     std::vector<std::uint8_t> truncated = {1};
     EXPECT_THROW(
         std::ignore = rapidsmpf::Statistics::deserialize(truncated), std::invalid_argument
     );
 }
 
+TEST_F(StatisticsTest, DeserializeRejectsOutOfRangeFormatter) {
+    // Craft a payload with one report-entry whose formatter byte is out of
+    // range. Layout: [enabled=1][num_stats=0][num_entries=1]
+    //                [name_len=1]["x"][formatter=0xFF][num_stat_names=1]
+    //                [sn_len=1]["y"]
+    auto const poke_u64 = [](std::vector<std::uint8_t>& v, std::uint64_t x) {
+        for (int i = 0; i < 8; ++i)
+            v.push_back(static_cast<std::uint8_t>((x >> (i * 8)) & 0xFF));
+    };
+    std::vector<std::uint8_t> buf;
+    buf.push_back(1);  // enabled
+    poke_u64(buf, 0);  // num_stats
+    poke_u64(buf, 1);  // num_entries
+    poke_u64(buf, 1);  // name_len
+    buf.push_back('x');
+    buf.push_back(0xFF);  // formatter value well past Formatter::_Count
+    poke_u64(buf, 1);  // num_stat_names
+    poke_u64(buf, 1);  // sn_len
+    buf.push_back('y');
+
+    EXPECT_THROW(
+        std::ignore = rapidsmpf::Statistics::deserialize(buf), std::invalid_argument
+    );
+}
+
+TEST_F(StatisticsTest, SerializeRoundTripPreservesEnabledFlag) {
+    // A disabled Statistics should come back disabled after a round-trip.
+    rapidsmpf::Statistics disabled(false);
+    auto const bytes = disabled.serialize();
+    auto deserialized = rapidsmpf::Statistics::deserialize(bytes);
+    EXPECT_FALSE(deserialized->enabled());
+
+    // And an enabled one comes back enabled.
+    rapidsmpf::Statistics enabled(true);
+    auto const bytes2 = enabled.serialize();
+    auto deserialized2 = rapidsmpf::Statistics::deserialize(bytes2);
+    EXPECT_TRUE(deserialized2->enabled());
+}
+
+TEST_F(StatisticsTest, SerializeRoundTripWithReportEntries) {
+    rapidsmpf::Statistics stats;
+    stats.add_bytes_stat("alpha", 2048);  // Bytes entry
+    stats.add_duration_stat("beta", rapidsmpf::Duration{0.005});  // Duration entry
+    stats.add_report_entry(
+        "copy",
+        {"copy-bytes", "copy-time", "copy-delay"},
+        rapidsmpf::Statistics::Formatter::MemCopy
+    );
+    stats.add_stat("copy-bytes", 1024.0 * 1024.0);
+    stats.add_stat("copy-time", 0.002);
+    stats.add_stat("copy-delay", 0.00001);
+
+    auto const bytes = stats.serialize();
+    auto deserialized = rapidsmpf::Statistics::deserialize(bytes);
+
+    // Stats round-trip numerically.
+    EXPECT_EQ(deserialized->get_stat("alpha"), stats.get_stat("alpha"));
+    EXPECT_EQ(deserialized->get_stat("beta"), stats.get_stat("beta"));
+    EXPECT_EQ(deserialized->get_stat("copy-bytes"), stats.get_stat("copy-bytes"));
+
+    // And crucially, formatter metadata is preserved: the deserialized
+    // report renders formatted values, not raw numbers.
+    auto const deser_report = deserialized->report();
+    EXPECT_THAT(deser_report, ::testing::HasSubstr("2 KiB"));  // alpha via Bytes
+    EXPECT_THAT(deser_report, ::testing::HasSubstr("1 MiB"));  // copy composite
+}
+
 TEST_F(StatisticsTest, Copy) {
     rapidsmpf::Statistics stats;
-    stats.add_stat("x", 10.0);
-    stats.register_formatter(
-        "x", [](std::ostream& os, std::vector<rapidsmpf::Statistics::Stat> const& s) {
-            os << "fmt:" << s[0].value();
-        }
-    );
+    stats.add_bytes_stat("x", 2048);  // registers a Bytes report entry
 
     auto copied = stats.copy();
     EXPECT_TRUE(copied->enabled());
     EXPECT_EQ(copied->get_stat("x"), stats.get_stat("x"));
-    EXPECT_THAT(copied->report(), ::testing::HasSubstr("fmt:10"));
+    // The Bytes formatter carried over the copy.
+    EXPECT_THAT(copied->report(), ::testing::HasSubstr("2 KiB"));
 }
 
 TEST_F(StatisticsTest, MergeOverlapping) {
@@ -529,25 +562,20 @@ TEST_F(StatisticsTest, MergeEmpty) {
     EXPECT_EQ(merged2->list_stat_names().size(), 1);
 }
 
-TEST_F(StatisticsTest, MergeUsesThisFormatters) {
+TEST_F(StatisticsTest, MergeCombinesReportEntries) {
     auto a = std::make_shared<rapidsmpf::Statistics>();
-    a->register_formatter(
-        "x", [](std::ostream& os, std::vector<rapidsmpf::Statistics::Stat> const& s) {
-            os << "custom:" << s[0].value();
-        }
-    );
-    a->add_stat("x", 10.0);
+    a->add_bytes_stat("x", 10);  // Bytes report entry
 
     auto b = std::make_shared<rapidsmpf::Statistics>();
-    b->add_stat("x", 5.0);
+    b->add_stat("x", 5.0);  // no formatter on this side
 
-    // Merging a (has formatter) with b: result uses a's formatter.
+    // Merging a (has Bytes entry) with b: result uses a's entry.
     auto merged = a->merge(b);
-    EXPECT_THAT(merged->report(), ::testing::HasSubstr("custom:15"));
+    EXPECT_THAT(merged->report(), ::testing::HasSubstr("15 B"));
 
-    // Merging b (no formatter) with a: result does not have the formatter.
+    // Merging b (no entry) with a: entry from a fills in.
     auto merged2 = b->merge(a);
-    EXPECT_THAT(merged2->report(), ::testing::Not(::testing::HasSubstr("custom:")));
+    EXPECT_THAT(merged2->report(), ::testing::HasSubstr("15 B"));
 }
 
 TEST_F(StatisticsTest, MergeSpan) {
