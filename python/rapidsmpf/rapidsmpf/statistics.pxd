@@ -42,9 +42,6 @@ cdef extern from "<rapidsmpf/statistics.hpp>" nogil:
         unordered_map[string, cpp_MemoryRecord] get_memory_records() \
             except +ex_handler
         shared_ptr[cpp_Statistics] copy() except +ex_handler
-        shared_ptr[cpp_Statistics] merge_many "merge"(
-            vector[shared_ptr[cpp_Statistics]] others
-        ) except +ex_handler
         vector[uint8_t] serialize() except +ex_handler
 
     cdef struct cpp_MemoryRecord "rapidsmpf::Statistics::MemoryRecord":

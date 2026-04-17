@@ -195,7 +195,7 @@ def test_merge_overlapping() -> None:
     b = Statistics(enable=True)
     b.add_stat("x", 7.0)
 
-    merged = a.merge([b])
+    merged = Statistics.merge([a, b])
     s = merged.get_stat("x")
     assert s["count"] == 3
     assert s["value"] == 20.0
@@ -209,7 +209,7 @@ def test_merge_disjoint() -> None:
     b = Statistics(enable=True)
     b.add_stat("y", 2.0)
 
-    merged = a.merge([b])
+    merged = Statistics.merge([a, b])
     assert len(merged.list_stat_names()) == 2
     assert merged.get_stat("x") == a.get_stat("x")
     assert merged.get_stat("y") == b.get_stat("y")
@@ -225,18 +225,54 @@ def test_merge_multiple() -> None:
     c = Statistics(enable=True)
     c.add_stat("y", 10.0)
 
-    merged = a.merge([b, c])
+    merged = Statistics.merge([a, b, c])
     assert len(merged.list_stat_names()) == 2
     assert merged.get_stat("x")["value"] == 3.0
     assert merged.get_stat("y")["value"] == 10.0
 
 
-def test_merge_empty() -> None:
-    a = Statistics(enable=True)
-    a.add_stat("x", 5.0)
+def test_merge_rejects_empty() -> None:
+    with pytest.raises(ValueError):
+        Statistics.merge([])
 
-    merged = a.merge([])
-    assert merged.get_stat("x") == a.get_stat("x")
+
+def test_merge_rejects_conflicting_formatter() -> None:
+    a = Statistics(enable=True)
+    a.add_report_entry("x", ["x"], Formatter.Bytes)
+    a.add_stat("x", 1.0)
+
+    b = Statistics(enable=True)
+    b.add_report_entry("x", ["x"], Formatter.Duration)
+    b.add_stat("x", 2.0)
+
+    with pytest.raises(ValueError):
+        Statistics.merge([a, b])
+
+
+def test_merge_rejects_conflicting_stat_names() -> None:
+    a = Statistics(enable=True)
+    a.add_report_entry("copy", ["b1", "t1", "d1"], Formatter.MemCopy)
+
+    b = Statistics(enable=True)
+    b.add_report_entry("copy", ["b2", "t2", "d2"], Formatter.MemCopy)
+
+    with pytest.raises(ValueError):
+        Statistics.merge([a, b])
+
+
+def test_merge_preserves_report_entry_formatter() -> None:
+    # Both sides declare the same Bytes report entry; the merged report
+    # renders with the Bytes formatter.
+    a = Statistics(enable=True)
+    a.add_report_entry("payload", ["payload"], Formatter.Bytes)
+    a.add_stat("payload", 1024.0)
+
+    b = Statistics(enable=True)
+    b.add_report_entry("payload", ["payload"], Formatter.Bytes)
+    b.add_stat("payload", 1024.0)
+
+    merged = Statistics.merge([a, b])
+    assert "2 KiB" in merged.report()
 
 
 def test_add_report_entry_bytes() -> None:

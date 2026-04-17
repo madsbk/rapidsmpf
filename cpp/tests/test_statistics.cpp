@@ -527,7 +527,8 @@ TEST_F(StatisticsTest, MergeOverlapping) {
     auto b = std::make_shared<rapidsmpf::Statistics>();
     b->add_stat("x", 7.0);  // count=1, value=7, max=7
 
-    auto merged = a->merge(b);
+    std::vector<std::shared_ptr<rapidsmpf::Statistics>> inputs{a, b};
+    auto merged = rapidsmpf::Statistics::merge(std::span{inputs});
     auto s = merged->get_stat("x");
     EXPECT_EQ(s.count(), 3);
     EXPECT_EQ(s.value(), 20.0);
@@ -541,23 +542,26 @@ TEST_F(StatisticsTest, MergeDisjoint) {
     auto b = std::make_shared<rapidsmpf::Statistics>();
     b->add_stat("y", 2.0);
 
-    auto merged = a->merge(b);
+    std::vector<std::shared_ptr<rapidsmpf::Statistics>> inputs{a, b};
+    auto merged = rapidsmpf::Statistics::merge(std::span{inputs});
     EXPECT_EQ(merged->list_stat_names().size(), 2);
     EXPECT_EQ(merged->get_stat("x"), a->get_stat("x"));
     EXPECT_EQ(merged->get_stat("y"), b->get_stat("y"));
 }
 
-TEST_F(StatisticsTest, MergeEmpty) {
+TEST_F(StatisticsTest, MergeWithEmpty) {
     auto a = std::make_shared<rapidsmpf::Statistics>();
     a->add_stat("x", 5.0);
 
     auto empty = std::make_shared<rapidsmpf::Statistics>();
 
-    auto merged = a->merge(empty);
+    std::vector<std::shared_ptr<rapidsmpf::Statistics>> inputs{a, empty};
+    auto merged = rapidsmpf::Statistics::merge(std::span{inputs});
     EXPECT_EQ(merged->get_stat("x"), a->get_stat("x"));
     EXPECT_EQ(merged->list_stat_names().size(), 1);
 
-    auto merged2 = empty->merge(a);
+    std::vector<std::shared_ptr<rapidsmpf::Statistics>> rev{empty, a};
+    auto merged2 = rapidsmpf::Statistics::merge(std::span{rev});
     EXPECT_EQ(merged2->get_stat("x"), a->get_stat("x"));
     EXPECT_EQ(merged2->list_stat_names().size(), 1);
 }
@@ -570,15 +574,17 @@ TEST_F(StatisticsTest, MergeCombinesReportEntries) {
     b->add_stat("x", 5.0);  // no formatter on this side
 
     // Merging a (has Bytes entry) with b: result uses a's entry.
-    auto merged = a->merge(b);
+    std::vector<std::shared_ptr<rapidsmpf::Statistics>> inputs{a, b};
+    auto merged = rapidsmpf::Statistics::merge(std::span{inputs});
     EXPECT_THAT(merged->report(), ::testing::HasSubstr("15 B"));
 
-    // Merging b (no entry) with a: entry from a fills in.
-    auto merged2 = b->merge(a);
+    // Order doesn't matter for filling in a missing entry.
+    std::vector<std::shared_ptr<rapidsmpf::Statistics>> rev{b, a};
+    auto merged2 = rapidsmpf::Statistics::merge(std::span{rev});
     EXPECT_THAT(merged2->report(), ::testing::HasSubstr("15 B"));
 }
 
-TEST_F(StatisticsTest, MergeSpan) {
+TEST_F(StatisticsTest, MergeMultiple) {
     auto a = std::make_shared<rapidsmpf::Statistics>();
     a->add_stat("x", 1.0);
 
@@ -588,10 +594,88 @@ TEST_F(StatisticsTest, MergeSpan) {
     auto c = std::make_shared<rapidsmpf::Statistics>();
     c->add_stat("y", 10.0);
 
-    std::vector<std::shared_ptr<rapidsmpf::Statistics>> others{b, c};
-    auto merged = a->merge(std::span{others});
+    std::vector<std::shared_ptr<rapidsmpf::Statistics>> inputs{a, b, c};
+    auto merged = rapidsmpf::Statistics::merge(std::span{inputs});
 
     EXPECT_EQ(merged->list_stat_names().size(), 2);
     EXPECT_EQ(merged->get_stat("x").value(), 3.0);
     EXPECT_EQ(merged->get_stat("y").value(), 10.0);
+}
+
+TEST_F(StatisticsTest, MergeRejectsEmptySpan) {
+    std::vector<std::shared_ptr<rapidsmpf::Statistics>> empty;
+    EXPECT_THROW(
+        std::ignore = rapidsmpf::Statistics::merge(std::span{empty}),
+        std::invalid_argument
+    );
+}
+
+TEST_F(StatisticsTest, MergeRejectsNullElement) {
+    auto a = std::make_shared<rapidsmpf::Statistics>();
+    std::vector<std::shared_ptr<rapidsmpf::Statistics>> inputs{a, nullptr};
+    EXPECT_THROW(
+        std::ignore = rapidsmpf::Statistics::merge(std::span{inputs}),
+        std::invalid_argument
+    );
+}
+
+TEST_F(StatisticsTest, MergeRejectsConflictingFormatter) {
+    auto a = std::make_shared<rapidsmpf::Statistics>();
+    a->add_report_entry("x", {"x"}, rapidsmpf::Statistics::Formatter::Bytes);
+    a->add_stat("x", 1.0);
+
+    auto b = std::make_shared<rapidsmpf::Statistics>();
+    b->add_report_entry("x", {"x"}, rapidsmpf::Statistics::Formatter::Duration);
+    b->add_stat("x", 2.0);
+
+    std::vector<std::shared_ptr<rapidsmpf::Statistics>> inputs{a, b};
+    EXPECT_THROW(
+        std::ignore = rapidsmpf::Statistics::merge(std::span{inputs}),
+        std::invalid_argument
+    );
+}
+
+TEST_F(StatisticsTest, MergeIdenticalReportEntries) {
+    // Two inputs with the same report entry (same formatter + stat_names)
+    // must merge cleanly — no conflict.
+    auto a = std::make_shared<rapidsmpf::Statistics>();
+    a->add_bytes_stat("x", 10);
+
+    auto b = std::make_shared<rapidsmpf::Statistics>();
+    b->add_bytes_stat("x", 20);
+
+    std::vector<std::shared_ptr<rapidsmpf::Statistics>> inputs{a, b};
+    auto merged = rapidsmpf::Statistics::merge(std::span{inputs});
+    EXPECT_THAT(merged->report(), ::testing::HasSubstr("30 B"));
+}
+
+TEST_F(StatisticsTest, MergeEnabledFlagPropagates) {
+    auto enabled = std::make_shared<rapidsmpf::Statistics>(true);
+    auto disabled = std::make_shared<rapidsmpf::Statistics>(false);
+
+    // disabled + disabled -> disabled.
+    std::vector<std::shared_ptr<rapidsmpf::Statistics>> both_off{disabled, disabled};
+    EXPECT_FALSE(rapidsmpf::Statistics::merge(std::span{both_off})->enabled());
+
+    // disabled + enabled -> enabled.
+    std::vector<std::shared_ptr<rapidsmpf::Statistics>> mixed{disabled, enabled};
+    EXPECT_TRUE(rapidsmpf::Statistics::merge(std::span{mixed})->enabled());
+}
+
+TEST_F(StatisticsTest, MergeRejectsConflictingStatNames) {
+    auto a = std::make_shared<rapidsmpf::Statistics>();
+    a->add_report_entry(
+        "copy", {"b1", "t1", "d1"}, rapidsmpf::Statistics::Formatter::MemCopy
+    );
+
+    auto b = std::make_shared<rapidsmpf::Statistics>();
+    b->add_report_entry(
+        "copy", {"b2", "t2", "d2"}, rapidsmpf::Statistics::Formatter::MemCopy
+    );
+
+    std::vector<std::shared_ptr<rapidsmpf::Statistics>> inputs{a, b};
+    EXPECT_THROW(
+        std::ignore = rapidsmpf::Statistics::merge(std::span{inputs}),
+        std::invalid_argument
+    );
 }

@@ -263,37 +263,29 @@ class Statistics {
     );
 
     /**
-     * @brief Merges this Statistics with another, returning a new Statistics.
+     * @brief Merge a set of Statistics into a new instance.
      *
-     * For each stat name present in either object, the result has the summed
-     * count, summed value, and the maximum of the two maxima. Report entries
-     * are taken from `*this`; entries present only in @p other are copied
-     * across.
+     * For each stat name present across the inputs, the result contains the
+     * summed count, summed value, and the maximum of the recorded maxima.
+     * The result's `enabled()` is true if any input is enabled. Memory
+     * records are not merged.
      *
-     * @note Memory records are not merged.
+     * Report entries are unified by name. If multiple inputs contain the
+     * same report-entry name, their `Formatter` and `stat_names` must match;
+     * otherwise, this function throws `std::invalid_argument` to prevent
+     * silent rendering inconsistencies (especially across
+     * serialize/deserialize boundaries).
      *
-     * @param other The Statistics to merge with. Must not be null.
-     * @return A shared pointer to a new Statistics containing the merged stats.
+     * @param stats Non-empty span of non-null `Statistics` instances to merge.
+     * @return A new `Statistics` instance containing the merged data.
+     *
+     * @throws std::invalid_argument If @p stats is empty, contains a null
+     * pointer, or if inputs disagree on the formatter or stat-name set for
+     * a shared report entry.
      */
-    [[nodiscard]] std::shared_ptr<Statistics> merge(
-        std::shared_ptr<Statistics> const& other
-    ) const;
-
-    /**
-     * @brief Merges this Statistics with multiple others.
-     *
-     * Equivalent to calling `merge()` repeatedly. Report entries are taken
-     * from `*this`; entries present only in one of @p others are copied
-     * across in iteration order (first-wins on name conflict).
-     *
-     * @note Memory records are not merged.
-     *
-     * @param others The Statistics objects to merge with. No element may be null.
-     * @return A shared pointer to a new Statistics containing the merged stats.
-     */
-    [[nodiscard]] std::shared_ptr<Statistics> merge(
-        std::span<std::shared_ptr<Statistics> const> others
-    ) const;
+    [[nodiscard]] static std::shared_ptr<Statistics> merge(
+        std::span<std::shared_ptr<Statistics> const> stats
+    );
 
     /**
      * @brief Represents a single tracked statistic.

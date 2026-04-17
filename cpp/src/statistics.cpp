@@ -628,35 +628,57 @@ std::shared_ptr<Statistics> Statistics::deserialize(std::span<std::uint8_t const
 }
 
 std::shared_ptr<Statistics> Statistics::merge(
-    std::shared_ptr<Statistics> const& other
-) const {
-    RAPIDSMPF_EXPECTS(other != nullptr, "Statistics pointer must not be null");
-    std::scoped_lock lock(mutex_, other->mutex_);
+    std::span<std::shared_ptr<Statistics> const> stats
+) {
+    RAPIDSMPF_EXPECTS(
+        !stats.empty(),
+        "Statistics::merge: input span must not be empty",
+        std::invalid_argument
+    );
 
-    auto ret = std::make_shared<Statistics>(enabled_.load(std::memory_order_acquire));
-    ret->stats_ = stats_;
-    ret->report_entries_ = report_entries_;
+    // Snapshot each input under its own mutex. Folding the snapshots
+    // afterwards avoids having to hold multiple mutexes at once.
+    struct Snapshot {
+        std::map<std::string, Stat> stats;
+        std::map<std::string, ReportEntry> entries;
+        bool enabled;
+    };
 
-    for (auto const& [name, stat] : other->stats_) {
-        auto [it, inserted] = ret->stats_.try_emplace(name, stat);
-        if (!inserted) {
-            it->second = it->second.merge(stat);
+    std::vector<Snapshot> snapshots;
+    snapshots.reserve(stats.size());
+    for (auto const& s : stats) {
+        RAPIDSMPF_EXPECTS(
+            s != nullptr,
+            "Statistics::merge: pointer must not be null",
+            std::invalid_argument
+        );
+        std::lock_guard lock(s->mutex_);
+        snapshots.push_back({s->stats_, s->report_entries_, s->enabled()});
+    }
+
+    bool const any_enabled =
+        std::ranges::any_of(snapshots, [](auto const& s) { return s.enabled; });
+    auto ret = std::make_shared<Statistics>(any_enabled);
+
+    for (auto const& snap : snapshots) {
+        for (auto const& [name, stat] : snap.stats) {
+            auto [it, inserted] = ret->stats_.try_emplace(name, stat);
+            if (!inserted) {
+                it->second = it->second.merge(stat);
+            }
         }
-    }
-    // Report entries from `other` fill in any gaps (first-wins matches
-    // the single-rank behavior of add_report_entry).
-    for (auto const& [name, entry] : other->report_entries_) {
-        ret->report_entries_.try_emplace(name, entry);
-    }
-    return ret;
-}
-
-std::shared_ptr<Statistics> Statistics::merge(
-    std::span<std::shared_ptr<Statistics> const> others
-) const {
-    auto ret = copy();
-    for (auto const& other : others) {
-        ret = ret->merge(other);
+        for (auto const& [name, entry] : snap.entries) {
+            auto [it, inserted] = ret->report_entries_.try_emplace(name, entry);
+            if (!inserted) {
+                RAPIDSMPF_EXPECTS(
+                    it->second.formatter == entry.formatter
+                        && it->second.stat_names == entry.stat_names,
+                    "Statistics::merge: report entry '" + name
+                        + "' has conflicting formatter or stat_names",
+                    std::invalid_argument
+                );
+            }
+        }
     }
     return ret;
 }

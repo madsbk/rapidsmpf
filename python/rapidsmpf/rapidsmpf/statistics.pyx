@@ -76,6 +76,16 @@ cdef extern from *:
             std::span<std::uint8_t const>(v.data(), v.size())
         );
     }
+    // Wrap the span-based Statistics::merge so Cython can pass a vector.
+    std::shared_ptr<rapidsmpf::Statistics> cpp_merge_statistics(
+        std::vector<std::shared_ptr<rapidsmpf::Statistics>> const& v
+    ) {
+        return rapidsmpf::Statistics::merge(
+            std::span<std::shared_ptr<rapidsmpf::Statistics> const>(
+                v.data(), v.size()
+            )
+        );
+    }
     """
     size_t cpp_get_statistic_count(cpp_Statistics stats, string name) \
         except +ex_handler nogil
@@ -90,6 +100,9 @@ cdef extern from *:
     string cpp_write_json_string(cpp_Statistics stats) except +ex_handler nogil
     shared_ptr[cpp_Statistics] cpp_deserialize_statistics(
         const vector[uint8_t]& v
+    ) except +ex_handler nogil
+    shared_ptr[cpp_Statistics] cpp_merge_statistics(
+        const vector[shared_ptr[cpp_Statistics]]& v
     ) except +ex_handler nogil
 
 cdef class Statistics:
@@ -391,29 +404,38 @@ cdef class Statistics:
             ret._handle = deref(self._handle).copy()
         return ret
 
-    def merge(self, others):
+    @staticmethod
+    def merge(stats):
         """
-        Merges this Statistics with a sequence of others.
+        Merge a sequence of Statistics into a new one.
 
-        For each stat name present in any object, the result has the summed
-        count, summed value, and the maximum of the two maxima. Formatters are
-        taken from this object. Memory records are not merged.
+        For each stat name present in any input, the result has the summed
+        count, summed value, and the maximum of the maxes. Report entries
+        with the same name must agree on formatter and stat-name list;
+        otherwise the call raises ``ValueError``. Memory records are not
+        merged.
 
         Parameters
         ----------
-        others
-            A sequence of Statistics to merge with.
+        stats
+            A non-empty sequence of :class:`Statistics` to merge.
 
         Returns
         -------
-        A new Statistics containing the merged stats.
+        A new :class:`Statistics` containing the merged data.
+
+        Raises
+        ------
+        ValueError
+            If ``stats`` is empty or two inputs have conflicting report
+            entries.
         """
         cdef Statistics ret = Statistics.__new__(Statistics)
-        cdef vector[shared_ptr[cpp_Statistics]] cpp_others
-        for item in others:
-            cpp_others.push_back((<Statistics?>item)._handle)
+        cdef vector[shared_ptr[cpp_Statistics]] v
+        for item in stats:
+            v.push_back((<Statistics?>item)._handle)
         with nogil:
-            ret._handle = deref(self._handle).merge_many(cpp_others)
+            ret._handle = cpp_merge_statistics(v)
         return ret
 
     def write_json_string(self) -> str:
