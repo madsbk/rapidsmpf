@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 from cython cimport no_gc_clear
@@ -27,7 +27,8 @@ cdef class SpillableMessages:
     Parameters
     ----------
     br
-        A BufferResource to keep alive.
+        A BufferResource to keep alive. Spill statistics are recorded to its
+        `Statistics` instance.
 
     Examples
     --------
@@ -37,7 +38,7 @@ cdef class SpillableMessages:
     >>> recovered = msgs.extract(mid=mid)
     """
     def __init__(self, BufferResource br not None):
-        self._handle = make_shared[cpp_SpillableMessages]()
+        self._handle = make_shared[cpp_SpillableMessages](br.ptr().statistics())
         self._br = br
 
     def __dealloc__(self):

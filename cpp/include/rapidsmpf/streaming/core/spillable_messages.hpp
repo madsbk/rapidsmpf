@@ -13,7 +13,9 @@
 
 #include <rapidsmpf/memory/buffer_resource.hpp>
 #include <rapidsmpf/memory/content_description.hpp>
+#include <rapidsmpf/statistics.hpp>
 #include <rapidsmpf/streaming/core/message.hpp>
+#include <rapidsmpf/utils/misc.hpp>
 
 namespace rapidsmpf::streaming {
 
@@ -41,7 +43,14 @@ class SpillableMessages {
     /// @brief Unique identifier assigned to each message.
     using MessageId = std::uint64_t;
 
-    SpillableMessages() = default;
+    /**
+     * @brief Constructs a container, optionally recording spill statistics.
+     *
+     * @param statistics The statistics instance to use (disabled by default).
+     */
+    explicit SpillableMessages(
+        std::shared_ptr<Statistics> statistics = Statistics::disabled()
+    );
     SpillableMessages(SpillableMessages const&) = delete;
     SpillableMessages& operator=(SpillableMessages const&) = delete;
     SpillableMessages(SpillableMessages&&) noexcept = delete;
@@ -165,11 +174,26 @@ class SpillableMessages {
         Item(Message&& message) : message(std::move(message)) {}
     };
 
+    /**
+     * @brief Returns how long @p mid has been spilled, if it is spilled at all.
+     *
+     * The caller must hold `global_mutex_`. Returns the duration to record once the
+     * lock is released, or `std::nullopt` when the message was never spilled.
+     *
+     * @param mid Message identifier.
+     * @param end_interval Whether to forget the message, so the next spill starts
+     * a new interval. False when it is needed again but stays in the container.
+     * @return The time spent spilled, if any.
+     */
+    std::optional<Duration> measure_residence_unsafe(MessageId mid, bool end_interval);
+
     // Never lock the global mutex and an item's mutex at the same time!
     mutable std::mutex global_mutex_;
     MessageId counter_{0};
     std::unordered_map<MessageId, std::shared_ptr<Item>> items_;
     mutable std::map<MessageId, ContentDescription> content_descriptions_;
+    mutable std::map<MessageId, Clock::time_point> spilled_at_;
+    std::shared_ptr<Statistics> statistics_;
 };
 
 }  // namespace rapidsmpf::streaming

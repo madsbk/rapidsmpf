@@ -71,11 +71,11 @@ Context::Context(
       options_{std::move(options)},
       logger_{std::move(logger)},
       executor_{std::move(executor)},
-      br_{std::move(br)},
-      spillable_messages_{std::make_shared<SpillableMessages>()} {
+      br_{std::move(br)} {
     RAPIDSMPF_EXPECTS(logger_ != nullptr, "logger cannot be NULL");
     RAPIDSMPF_EXPECTS(executor_ != nullptr, "executor cannot be NULL");
     RAPIDSMPF_EXPECTS(br_ != nullptr, "br cannot be NULL");
+    spillable_messages_ = std::make_shared<SpillableMessages>(br_->statistics());
 
     // Setup a spilling function.
     spill_function_id_ = br_->spill_manager().add_spill_function(

@@ -65,6 +65,27 @@ Message create_int_msg(
     };
 }
 
+/**
+ * @brief Insert a spillable device message and spill it.
+ *
+ * @param msgs Container to insert into.
+ * @param br Buffer resource used to spill.
+ * @param sequence_number Sequence number of the message, also used as its payload.
+ * @return The identifier of the spilled message.
+ */
+SpillableMessages::MessageId insert_and_spill(
+    SpillableMessages& msgs, BufferResource* br, std::uint64_t sequence_number = 1
+) {
+    auto mid = msgs.insert(create_int_msg(
+        sequence_number,
+        static_cast<int>(sequence_number),
+        MemoryType::DEVICE,
+        ContentDescription::Spillable::YES
+    ));
+    EXPECT_EQ(msgs.spill(mid, br), sizeof(int));
+    return mid;
+}
+
 TEST_F(StreamingSpillableMessages, ExtractError) {
     SpillableMessages msgs;
     EXPECT_THROW(std::ignore = msgs.extract(0), std::out_of_range);
@@ -291,4 +312,109 @@ TEST_F(StreamingSpillableMessages, Copy) {
     auto original = msgs.extract(mid);
     EXPECT_EQ(original.sequence_number(), 1);
     EXPECT_EQ(original.get<int>(), 42);
+}
+
+TEST_F(StreamingSpillableMessages, StatisticsNotRecordedWhenNeverSpilled) {
+    auto stats = Statistics::create();
+    SpillableMessages msgs{stats};
+
+    auto mid = msgs.insert(
+        create_int_msg(1, 2, MemoryType::DEVICE, ContentDescription::Spillable::YES)
+    );
+    std::ignore = msgs.extract(mid);
+
+    // A message that was never spilled has no residence and released no bytes.
+    EXPECT_THROW(
+        std::ignore = stats->get_stat("message-spill-residence-time"), std::out_of_range
+    );
+    EXPECT_THROW(std::ignore = stats->get_stat("message-spill-bytes"), std::out_of_range);
+}
+
+TEST_F(StreamingSpillableMessages, StatisticsRecordedOnExtract) {
+    auto stats = Statistics::create();
+    SpillableMessages msgs{stats};
+    auto mid = insert_and_spill(msgs, br.get());
+
+    // Spilling records the released bytes but no residence, the message is still here.
+    EXPECT_EQ(stats->get_stat("message-spill-bytes").count(), 1u);
+    EXPECT_EQ(stats->get_stat("message-spill-bytes").value(), sizeof(int));
+    EXPECT_THROW(
+        std::ignore = stats->get_stat("message-spill-residence-time"), std::out_of_range
+    );
+
+    std::ignore = msgs.extract(mid);
+    EXPECT_EQ(stats->get_stat("message-spill-residence-time").count(), 1u);
+}
+
+TEST_F(StreamingSpillableMessages, StatisticsRecordedOnCopyBackToDevice) {
+    auto stats = Statistics::create();
+    SpillableMessages msgs{stats};
+    auto mid = insert_and_spill(msgs, br.get());
+
+    // `fanout` reads staged messages with `copy()` rather than extracting them, so a
+    // copy back to device is the message being needed again. The entry is kept, so a
+    // second copy records a second sample.
+    auto res1 = br->reserve_or_fail(sizeof(int), {MemoryType::DEVICE});
+    std::ignore = msgs.copy(mid, res1);
+    EXPECT_EQ(stats->get_stat("message-spill-residence-time").count(), 1u);
+
+    auto res2 = br->reserve_or_fail(sizeof(int), {MemoryType::DEVICE});
+    std::ignore = msgs.copy(mid, res2);
+    EXPECT_EQ(stats->get_stat("message-spill-residence-time").count(), 2u);
+
+    // Extraction still ends the interval, for a third and final sample.
+    std::ignore = msgs.extract(mid);
+    EXPECT_EQ(stats->get_stat("message-spill-residence-time").count(), 3u);
+}
+
+TEST_F(StreamingSpillableMessages, StatisticsNotRecordedOnCopyToHost) {
+    auto stats = Statistics::create();
+    SpillableMessages msgs{stats};
+    auto mid = insert_and_spill(msgs, br.get());
+
+    // A copy that stays on host does not bring the data back, so it is not a sample.
+    auto res = br->reserve_or_fail(sizeof(int), {MemoryType::HOST});
+    std::ignore = msgs.copy(mid, res);
+    EXPECT_THROW(
+        std::ignore = stats->get_stat("message-spill-residence-time"), std::out_of_range
+    );
+}
+
+TEST_F(StreamingSpillableMessages, StatisticsAttributedPerMessage) {
+    auto stats = Statistics::create();
+    SpillableMessages msgs{stats};
+
+    // Two messages spilled, only one extracted: exactly one residence sample, which is
+    // what keying the interval per message is for.
+    auto mid1 = insert_and_spill(msgs, br.get(), 1);
+    auto mid2 = insert_and_spill(msgs, br.get(), 2);
+    EXPECT_EQ(stats->get_stat("message-spill-bytes").count(), 2u);
+
+    std::ignore = msgs.extract(mid2);
+    EXPECT_EQ(stats->get_stat("message-spill-residence-time").count(), 1u);
+
+    std::ignore = msgs.extract(mid1);
+    EXPECT_EQ(stats->get_stat("message-spill-residence-time").count(), 2u);
+}
+
+TEST_F(StreamingSpillableMessages, DefaultConstructedContainerStillSpills) {
+    // Statistics are disabled by default, which is what `Context` uses unless
+    // statistics are enabled.
+    SpillableMessages msgs;
+    auto mid = insert_and_spill(msgs, br.get());
+    EXPECT_EQ(msgs.extract(mid).get<int>(), 1);
+}
+
+TEST_F(StreamingSpillableMessages, StatisticsClearedWithTheContainer) {
+    auto stats = Statistics::create();
+    SpillableMessages msgs{stats};
+    std::ignore = insert_and_spill(msgs, br.get());
+
+    // Clearing drops the message without it ever being needed again, so the spill is
+    // still accounted for but there is no residence to record.
+    msgs.clear();
+    EXPECT_EQ(stats->get_stat("message-spill-bytes").count(), 1u);
+    EXPECT_THROW(
+        std::ignore = stats->get_stat("message-spill-residence-time"), std::out_of_range
+    );
 }
