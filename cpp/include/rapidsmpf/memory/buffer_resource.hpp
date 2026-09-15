@@ -509,10 +509,14 @@ class BufferResource : public std::enable_shared_from_this<BufferResource> {
      * @param data Unique pointer to the device or pinned host buffer.
      * @param stream CUDA stream associated with the new Buffer. Use or synchronize with
      * this stream when operating on the Buffer.
+     * @param track The spill record to adopt. Use this when the caller moved the data
+     * out of device memory itself and recorded the copy.
      * @return Unique pointer to the resulting Buffer.
      */
     std::unique_ptr<Buffer> move(
-        std::unique_ptr<rmm::device_buffer> data, cuda::stream_ref stream
+        std::unique_ptr<rmm::device_buffer> data,
+        cuda::stream_ref stream,
+        std::shared_ptr<SpillTrack> track = nullptr
     );
 
     /**

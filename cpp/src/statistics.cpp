@@ -95,6 +95,15 @@ constexpr std::array<FormatterFn, static_cast<std::size_t>(Statistics::Formatter
                    << count << " samples)";
             }
         },
+        // Implement `Statistics::Formatter::Ratio`
+        [](std::ostream& os, std::vector<Statistics::Stat> const& s) {
+            auto const count = s.at(0).count();
+            os << s.at(0).value() << "/" << count;
+            if (count > 0) {
+                os << " (" << std::fixed << std::setprecision(0)
+                   << s.at(0).value() / static_cast<double>(count) * 100.0 << "%)";
+            }
+        },
     }};
 
 template <typename T, typename... Properties>
@@ -691,7 +700,11 @@ std::shared_ptr<Statistics> Statistics::merge(
 }
 
 void Statistics::record_copy(
-    MemoryType src, MemoryType dst, std::size_t nbytes, StreamOrderedTiming&& timing
+    MemoryType src,
+    MemoryType dst,
+    std::size_t nbytes,
+    StreamOrderedTiming&& timing,
+    std::shared_ptr<SpillTrack> track
 ) {
     // Construct all stat names once, at first call.
     static Names2DArray const name_map = [] {
@@ -714,13 +727,61 @@ void Statistics::record_copy(
     auto const& names =
         name_map[static_cast<std::size_t>(src)][static_cast<std::size_t>(dst)];
 
-    timing.stop_and_record(names.time, names.stream_delay);
+    timing.stop_and_record(
+        names.time, names.stream_delay, spill_sink(src, dst, nbytes, std::move(track))
+    );
     add_stat(names.nbytes, static_cast<double>(nbytes));
     add_report_entry(
         names.base,
         {names.nbytes, names.time, names.stream_delay},
         Formatter::MemoryThroughput
     );
+}
+
+TimingSink Statistics::spill_sink(
+    MemoryType src, MemoryType dst, std::size_t nbytes, std::shared_ptr<SpillTrack> track
+) {
+    // While disabled every operation is a no-op, so the record must not be opened
+    // either: `enable()` later would otherwise close an interval it never saw begin.
+    if (track == nullptr || src == dst || !enabled()) {
+        return nullptr;
+    }
+    if (dst != MemoryType::DEVICE && src == MemoryType::DEVICE) {
+        // The data is being spilled. The copy's cost is known once the stream
+        // reaches it, and is what the return trip is judged against.
+        track->since = Clock::now();
+        return [track](Duration duration, Statistics&) {
+            track->out_seconds.store(duration.count(), std::memory_order_release);
+        };
+    }
+    if (dst == MemoryType::DEVICE && src != MemoryType::DEVICE) {
+        if (track->since == Clock::time_point{}) {
+            return nullptr;  // The record is not open, so there is nothing to close.
+        }
+        Duration const spilled{Clock::now() - track->since};
+        track->since = {};  // Closed, so a second unspill does not record again.
+        add_duration_stat("buffer-spilled-time", spilled);
+        return [track, nbytes, spilled](Duration back, Statistics& statistics) {
+            auto const out = track->out_seconds.load(std::memory_order_acquire);
+            if (out <= 0.0) {
+                // Either the copy that spilled the data was not measured, or its
+                // timing has yet to land, which can happen when the two copies use
+                // different streams. Skip rather than judge against half a round trip.
+                return;
+            }
+            // Recorded for every spill that could be judged, so the report says how
+            // many paid off rather than going quiet when none were wasted.
+            bool const wasted = spilled.count() < out + back.count();
+            statistics.add_stat("buffer-spilled-wasted", wasted ? 1.0 : 0.0);
+            statistics.add_report_entry(
+                "buffer-spilled-wasted", {"buffer-spilled-wasted"}, Formatter::Ratio
+            );
+            if (wasted) {
+                statistics.add_bytes_stat("buffer-spilled-wasted-bytes", nbytes);
+            }
+        };
+    }
+    return nullptr;
 }
 
 void Statistics::record_alloc(

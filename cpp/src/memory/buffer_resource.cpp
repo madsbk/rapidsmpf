@@ -279,7 +279,9 @@ std::unique_ptr<Buffer> BufferResource::make_buffer(
 }
 
 std::unique_ptr<Buffer> BufferResource::move(
-    std::unique_ptr<rmm::device_buffer> data, cuda::stream_ref stream
+    std::unique_ptr<rmm::device_buffer> data,
+    cuda::stream_ref stream,
+    std::shared_ptr<SpillTrack> track
 ) {
     cuda::stream_ref upstream = data->stream();
     if (upstream.get() != stream.get()) {
@@ -291,9 +293,11 @@ std::unique_ptr<Buffer> BufferResource::move(
         auto pinned_host_buffer = std::make_unique<HostBuffer>(
             HostBuffer::from_rmm_device_buffer(std::move(data), stream)
         );
-        return std::unique_ptr<Buffer>(
+        auto ret = std::unique_ptr<Buffer>(
             new Buffer(std::move(pinned_host_buffer), stream, MemoryType::PINNED_HOST)
         );
+        ret->spill_track_ = std::move(track);
+        return ret;
     }
     return std::unique_ptr<Buffer>(new Buffer(std::move(data), MemoryType::DEVICE));
 }

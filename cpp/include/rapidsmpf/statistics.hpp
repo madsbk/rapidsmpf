@@ -7,6 +7,7 @@
 #include <concepts>
 #include <cstddef>
 #include <filesystem>
+#include <functional>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -29,6 +30,33 @@
 #include <rapidsmpf/utils/misc.hpp>
 
 namespace rapidsmpf {
+
+class Statistics;
+
+/**
+ * @brief The record of a buffer's data while it is spilled.
+ *
+ * Shared by every `Buffer` holding the data while it is off device.
+ *
+ * @note Not thread safe. A record is only ever touched by the thread performing the
+ * copy, and `BufferResource` destroys the source of a relocation as soon as the copy
+ * returns, so no two live buffers share one.
+ */
+struct SpillTrack {
+    /// @brief When the data was spilled, unset once the record is closed.
+    Clock::time_point since{};
+    /// @brief The measured cost of the copy that spilled the data, in seconds, or zero
+    /// when no such copy was recorded.
+    std::atomic<double> out_seconds{0.0};
+};
+
+/**
+ * @brief Called with a stream-ordered duration once the stream reaches its stop marker.
+ *
+ * @param duration The measured duration.
+ * @param statistics The statistics the timing was recorded into.
+ */
+using TimingSink = std::function<void(Duration duration, Statistics& statistics)>;
 
 class StreamOrderedTiming;
 
@@ -101,6 +129,10 @@ class Statistics : public std::enable_shared_from_this<Statistics> {
      *   where the running total carries no meaning and the peak is the point:
      *   "max 8 | avg 2.5 (100 samples)"
      *
+     * - Ratio (1 stat): how often something held, recorded as one sample per
+     *   occasion carrying one or zero:
+     *   "3/12 (25%)"
+     *
      * `_Count` is an internal sentinel — always keep it last.
      */
     enum class Formatter : std::uint8_t {
@@ -110,6 +142,7 @@ class Statistics : public std::enable_shared_from_this<Statistics> {
         HitRate,
         MemoryThroughput,
         Gauge,
+        Ratio,
         _Count,  ///< Sentinel; must remain last.
     };
 
@@ -516,9 +549,16 @@ class Statistics : public std::enable_shared_from_this<Statistics> {
      * @param timing A `StreamOrderedTiming` that should be started just before the copy
      * was enqueued on the stream. Its `stop_and_record()` is called here to enqueue the
      * stop callback.
+     * @param track The spill record of the data being copied, or null when the copy
+     * does not relocate data. A spill opens the record, and an unspill closes it and
+     * writes the `buffer-spilled-*` statistics.
      */
     void record_copy(
-        MemoryType src, MemoryType dst, std::size_t nbytes, StreamOrderedTiming&& timing
+        MemoryType src,
+        MemoryType dst,
+        std::size_t nbytes,
+        StreamOrderedTiming&& timing,
+        std::shared_ptr<SpillTrack> track = nullptr
     );
 
     /**
@@ -631,6 +671,25 @@ class Statistics : public std::enable_shared_from_this<Statistics> {
         std::vector<std::string> stat_names;
         Formatter formatter;
     };
+
+    /**
+     * @brief Returns the sink that maintains @p track across a copy.
+     *
+     * A spill opens the record and an unspill closes it, writing the
+     * `buffer-spilled-*` statistics.
+     *
+     * @param src Source memory type.
+     * @param dst Destination memory type.
+     * @param nbytes Number of bytes copied.
+     * @param track The spill record, or null.
+     * @return The sink to hand to `StreamOrderedTiming::stop_and_record()`, or null.
+     */
+    TimingSink spill_sink(
+        MemoryType src,
+        MemoryType dst,
+        std::size_t nbytes,
+        std::shared_ptr<SpillTrack> track
+    );
 
     explicit Statistics(bool enabled);
 

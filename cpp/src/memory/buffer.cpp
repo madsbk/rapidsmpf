@@ -19,7 +19,6 @@
 
 namespace rapidsmpf {
 
-
 Buffer::Buffer(
     std::unique_ptr<HostBuffer> host_buffer, cuda::stream_ref stream, MemoryType mem_type
 )
@@ -168,7 +167,25 @@ void buffer_copy(
     // after the dst.write_access(), its last_write_event is recorded on dst.stream(). So,
     // we need the src.stream() to wait for that event.
     dst.latest_write_event().stream_wait(src.stream());
-    statistics->record_copy(src.mem_type(), dst.mem_type(), size, std::move(timing));
+
+    // A whole-buffer copy relocates the data, so the spill record follows it.
+    std::shared_ptr<SpillTrack> track;
+    if (src_offset == 0 && dst_offset == 0 && size == src.size && size == dst.size) {
+        if (dst.mem_type() == MemoryType::DEVICE) {
+            track = src.spill_track_;  // An unspill, so the record is closed.
+        } else if (src.mem_type() == MemoryType::DEVICE) {
+            dst.spill_track_ = std::make_shared<SpillTrack>();  // Spilled, record opens.
+            track = dst.spill_track_;
+        } else {
+            // Demoted between two off-device memory types, which `spill_partitions`
+            // does when the pinned pool is exhausted. Carrying the record over keeps
+            // the clock running and the spill counted.
+            dst.spill_track_ = src.spill_track_;
+        }
+    }
+    statistics->record_copy(
+        src.mem_type(), dst.mem_type(), size, std::move(timing), std::move(track)
+    );
 }
 
 }  // namespace rapidsmpf
