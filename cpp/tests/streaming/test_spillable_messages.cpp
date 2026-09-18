@@ -292,3 +292,84 @@ TEST_F(StreamingSpillableMessages, Copy) {
     EXPECT_EQ(original.sequence_number(), 1);
     EXPECT_EQ(original.get<int>(), 42);
 }
+
+// `spill-candidates` is the denominator for any claim about selection order, so it must
+// count only messages that could actually be chosen.
+
+TEST_F(StreamingSpillableMessages, SpillCandidatesCountsOnlyWhatCouldBeChosen) {
+    auto stats = Statistics::create();
+    auto br_stats = BufferResource::create(
+        rmm::mr::get_current_device_resource_ref(),
+        PinnedMemoryDisabled,
+        {{MemoryType::DEVICE, std::int64_t{1} << 20}},
+        /* periodic_spill_check = */ std::nullopt,
+        std::make_shared<StreamPool>(1),
+        stats
+    );
+    auto ctx_stats = std::make_shared<Context>(
+        rapidsmpf::config::Options{}, GlobalEnvironment->comm_->logger(), br_stats
+    );
+
+    // Two spillable on device, one not spillable, one already off device. Only the first
+    // two are candidates.
+    auto sm = ctx_stats->spillable_messages();
+    std::ignore = sm->insert(
+        create_int_msg(1, 1, MemoryType::DEVICE, ContentDescription::Spillable::YES)
+    );
+    std::ignore = sm->insert(
+        create_int_msg(2, 2, MemoryType::DEVICE, ContentDescription::Spillable::YES)
+    );
+    std::ignore = sm->insert(
+        create_int_msg(3, 3, MemoryType::DEVICE, ContentDescription::Spillable::NO)
+    );
+    std::ignore = sm->insert(
+        create_int_msg(4, 4, MemoryType::HOST, ContentDescription::Spillable::YES)
+    );
+
+    std::ignore = br_stats->spill_manager().spill(1);
+
+    EXPECT_EQ(stats->get_stat("spill-candidates").max(), 2.0);
+    EXPECT_EQ(
+        stats->get_stat("spill-candidate-bytes").value(),
+        static_cast<double>(2 * sizeof(int))
+    );
+    // The pool was not empty, so this call counts as a lookup but not a hit.
+    auto const none = stats->get_stat("spill-candidates-none");
+    EXPECT_EQ(none.count(), 1u);
+    EXPECT_EQ(none.value(), 0.0);
+}
+
+TEST_F(StreamingSpillableMessages, SpillCandidatesAreNotDilutedByEmptyCalls) {
+    // An empty pool is common and is not the same as a small one, so it is counted
+    // separately rather than averaged into the pool size.
+    auto stats = Statistics::create();
+    auto br_stats = BufferResource::create(
+        rmm::mr::get_current_device_resource_ref(),
+        PinnedMemoryDisabled,
+        {{MemoryType::DEVICE, std::int64_t{1} << 20}},
+        /* periodic_spill_check = */ std::nullopt,
+        std::make_shared<StreamPool>(1),
+        stats
+    );
+    auto ctx_stats = std::make_shared<Context>(
+        rapidsmpf::config::Options{}, GlobalEnvironment->comm_->logger(), br_stats
+    );
+
+    // Nothing to spill at all.
+    std::ignore = br_stats->spill_manager().spill(1);
+    EXPECT_THROW(std::ignore = stats->get_stat("spill-candidates"), std::out_of_range);
+    EXPECT_EQ(stats->get_stat("spill-candidates-none").value(), 1.0);
+
+    // One candidate, which must not be averaged with the empty call above.
+    std::ignore = ctx_stats->spillable_messages()->insert(
+        create_int_msg(1, 1, MemoryType::DEVICE, ContentDescription::Spillable::YES)
+    );
+    std::ignore = br_stats->spill_manager().spill(1);
+
+    auto const candidates = stats->get_stat("spill-candidates");
+    EXPECT_EQ(candidates.count(), 1u);
+    EXPECT_EQ(candidates.value(), 1.0);
+    auto const none = stats->get_stat("spill-candidates-none");
+    EXPECT_EQ(none.count(), 2u);
+    EXPECT_EQ(none.value(), 1.0);
+}

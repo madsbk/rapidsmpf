@@ -253,6 +253,11 @@ class MemoryReserveOrWait {
         /// @brief When the request was submitted, used to measure how long it waited.
         Clock::time_point submitted_at;
 
+        /// @brief The most memory seen available on any pass of the admission loop
+        /// while this request was pending. Mutable because the set exposes its
+        /// elements as const, and this field takes no part in the ordering.
+        mutable std::size_t peak_available{0};
+
         /// @brief Ordering by `size` and `sequence_number` (ascending).
         friend bool operator<(Request const& a, Request const& b) {
             return std::tie(a.size, a.sequence_number)

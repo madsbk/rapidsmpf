@@ -732,3 +732,224 @@ TEST_P(StreamingMemoryReserveOrWait, StatisticsDisabledRecordsNothing) {
 
     EXPECT_TRUE(stats->list_stat_names().empty());
 }
+
+// Whether the memory a timed-out request asked for was ever available while it waited.
+
+TEST_P(StreamingMemoryReserveOrWait, TimeoutReportsThatMemoryWasNeverAvailable) {
+    if (is_running_under_valgrind()) {
+        GTEST_SKIP() << "Test runs very slow in valgrind";
+    }
+
+    // No memory at all, so the request can only ever leave through the timeout and
+    // nothing it wanted was available at any point.
+    auto [br_stats, stats] = make_br_with_stats(/* device_limit = */ 0);
+    MemoryReserveOrWait mrow{
+        config::Options({{"memory_reserve_timeout", config::OptionValue("100ms")}}),
+        MemoryType::DEVICE,
+        ctx->executor(),
+        br_stats
+    };
+
+    std::vector<Actor> actors;
+    actors.push_back(waiter(mrow, /* size = */ 1024, 0, /* expected = */ 0));
+    run_actor_network(std::move(actors));
+
+    EXPECT_EQ(
+        stats->get_stat("reserve-device-wait-timeout-memory-was-available").value(), 0.0
+    );
+    EXPECT_EQ(
+        stats->get_stat("reserve-device-wait-timeout-peak-available-bytes").value(), 0.0
+    );
+}
+
+namespace {
+
+// Actor that takes a reservation and keeps it until `release` is set, so the memory
+// it holds stays out of reach of the other requests in the test.
+Actor holding_waiter(
+    MemoryReserveOrWait& mrow,
+    std::size_t size,
+    std::int64_t net_memory_delta,
+    std::atomic<bool>& release
+) {
+    auto res = co_await mrow.reserve_or_wait(size, net_memory_delta);
+    EXPECT_EQ(res.size(), size);
+    while (!release.load(std::memory_order_acquire)) {
+        co_await mrow.executor()->yield();
+    }
+}
+
+// The number of samples recorded under `name`, zero when it has yet to be recorded.
+std::size_t stat_count(Statistics& stats, std::string const& name) {
+    try {
+        return stats.get_stat(name).count();
+    } catch (std::out_of_range const&) {
+        return 0;
+    }
+}
+
+}  // namespace
+
+TEST_P(StreamingMemoryReserveOrWait, TimeoutReportsThatMemoryWasAvailable) {
+    if (is_running_under_valgrind()) {
+        GTEST_SKIP() << "Test runs very slow in valgrind";
+    }
+
+    // Two requests of the same size wait with nothing available. Memory for exactly
+    // one of them then turns up, and the loop admits the one with the smaller
+    // net_memory_delta. The loser saw its full size become available and still timed
+    // out, which is the case where forcing a spill was not the only way forward.
+    auto [br_stats, stats] = make_br_with_stats(/* device_limit = */ 0);
+    MemoryReserveOrWait mrow{
+        config::Options({{"memory_reserve_timeout", config::OptionValue("100ms")}}),
+        MemoryType::DEVICE,
+        ctx->executor(),
+        br_stats
+    };
+
+    std::atomic<bool> release{false};
+    std::vector<Actor> actors;
+    actors.push_back(holding_waiter(mrow, /* size = */ 1024, /* delta = */ 0, release));
+    actors.push_back(
+        waiter(mrow, /* size = */ 1024, /* delta = */ 1, /* expected = */ 0)
+    );
+
+    std::thread thd(run_actor_network, std::move(actors));
+
+    // Let both requests start waiting, then hand over room for exactly one.
+    while (mrow.size() < 2) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    br_stats->set_memory_limit(
+        MemoryType::DEVICE,
+        safe_cast<std::int64_t>(br_stats->device_mr_adaptor().current_allocated()) + 1024
+    );
+
+    // Hold the winner's reservation until the loser has given up.
+    while (stat_count(*stats, "reserve-device-wait-timeout-memory-was-available") < 1) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    release.store(true, std::memory_order_release);
+    thd.join();
+
+    EXPECT_EQ(
+        stats->get_stat("reserve-device-wait-timeout-memory-was-available").value(), 1.0
+    );
+    EXPECT_EQ(
+        stats->get_stat("reserve-device-wait-timeout-peak-available-bytes").value(),
+        1024.0
+    );
+}
+
+TEST_P(StreamingMemoryReserveOrWait, PeakAvailableIsTheMostSeenWhileWaiting) {
+    if (is_running_under_valgrind()) {
+        GTEST_SKIP() << "Test runs very slow in valgrind";
+    }
+
+    // 512 bytes are available throughout, and the request wants 1024. The peak says
+    // how close it got, and the verdict says the shortage was real.
+    auto [br_stats, stats] = make_br_with_stats(/* device_limit = */ 512);
+    MemoryReserveOrWait mrow{
+        config::Options({{"memory_reserve_timeout", config::OptionValue("100ms")}}),
+        MemoryType::DEVICE,
+        ctx->executor(),
+        br_stats
+    };
+
+    std::vector<Actor> actors;
+    actors.push_back(waiter(mrow, /* size = */ 1024, 0, /* expected = */ 0));
+    run_actor_network(std::move(actors));
+
+    EXPECT_EQ(
+        stats->get_stat("reserve-device-wait-timeout-peak-available-bytes").value(), 512.0
+    );
+    EXPECT_EQ(
+        stats->get_stat("reserve-device-wait-timeout-memory-was-available").value(), 0.0
+    );
+}
+
+TEST_P(StreamingMemoryReserveOrWait, OnlyATimedOutRequestOverbooks) {
+    if (is_running_under_valgrind()) {
+        GTEST_SKIP() << "Test runs very slow in valgrind";
+    }
+
+    // Overbooking is what drives available memory negative and so what the periodic
+    // spill thread reacts to. Since only the timeout path reaches it, the timeout count
+    // is also the count of spilling events, which is what lets
+    // `wait-timeout-memory-was-available` speak for the spilling that follows.
+    auto [br_stats, stats] = make_br_with_stats(/* device_limit = */ 1024);
+    MemoryReserveOrWait mrow{
+        config::Options({{"memory_reserve_timeout", config::OptionValue("100ms")}}),
+        MemoryType::DEVICE,
+        ctx->executor(),
+        br_stats
+    };
+
+    coro::sync_wait([](MemoryReserveOrWait& mrow) -> Actor {
+        // Fits at once, so it never waits and never overbooks.
+        auto [fits, overbooked] = co_await mrow.reserve_or_wait_or_overbook(1024, 0);
+        EXPECT_EQ(fits.size(), 1024u);
+        EXPECT_EQ(overbooked, 0u);
+    }(mrow));
+
+    EXPECT_EQ(stats->get_stat("reserve-device-wait-avoided").value(), 1.0);
+    EXPECT_THROW(
+        std::ignore = stats->get_stat("reserve-device-overbook-bytes"), std::out_of_range
+    );
+    EXPECT_THROW(
+        std::ignore = stats->get_stat("reserve-device-wait-timeout"), std::out_of_range
+    );
+
+    // Now one that cannot fit, so it waits, times out and overbooks.
+    coro::sync_wait([](MemoryReserveOrWait& mrow) -> Actor {
+        auto [over, overbooked] = co_await mrow.reserve_or_wait_or_overbook(2048, 0);
+        EXPECT_EQ(over.size(), 2048u);
+        EXPECT_GT(overbooked, 0u);
+    }(mrow));
+
+    EXPECT_EQ(stats->get_stat("reserve-device-wait-timeout").value(), 1.0);
+    EXPECT_EQ(stats->get_stat("reserve-device-overbook-bytes").count(), 1u);
+}
+
+TEST_P(StreamingMemoryReserveOrWait, SatisfiedPeakExcludesTheAdmittingPass) {
+    if (is_running_under_valgrind()) {
+        GTEST_SKIP() << "Test runs very slow in valgrind";
+    }
+
+    // A request that waits with nothing available and is then admitted once memory
+    // appears. The peak must report what it saw while waiting, not the availability
+    // that admitted it, which would trivially equal the size it asked for.
+    auto [br_stats, stats] = make_br_with_stats(/* device_limit = */ 0);
+    MemoryReserveOrWait mrow{
+        config::Options({{"memory_reserve_timeout", config::OptionValue("1 min")}}),
+        MemoryType::DEVICE,
+        ctx->executor(),
+        br_stats
+    };
+
+    std::vector<Actor> actors;
+    actors.push_back(waiter(mrow, /* size = */ 1024, 0, /* expected = */ 1024));
+    std::thread thd(run_actor_network, std::move(actors));
+
+    while (mrow.size() < 1) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    br_stats->set_memory_limit(
+        MemoryType::DEVICE,
+        safe_cast<std::int64_t>(br_stats->device_mr_adaptor().current_allocated()) + 1024
+    );
+    thd.join();
+
+    // Admitted, so no timeout was recorded.
+    EXPECT_THROW(
+        std::ignore = stats->get_stat("reserve-device-wait-timeout-peak-available-bytes"),
+        std::out_of_range
+    );
+    // It saw nothing available before the pass that admitted it.
+    EXPECT_EQ(
+        stats->get_stat("reserve-device-wait-satisfied-peak-available-bytes").value(), 0.0
+    );
+    EXPECT_EQ(
+        stats->get_stat("reserve-device-wait-satisfied-request-bytes").value(), 1024.0
+    );
+}

@@ -1002,7 +1002,13 @@ class BufferSpillStatistics : public ::testing::Test {
         return stats->has_stat(name) ? stats->get_stat(name).count() : 0;
     }
 
+    /// @brief The accumulated value of the statistic `name`.
+    double value(std::string const& name) const {
+        return stats->get_stat(name).value();
+    }
+
     static constexpr std::size_t size = 4_KiB;
+    static constexpr std::size_t medium = 4_MiB;
     rmm::mr::cuda_memory_resource mr_cuda;
     // Pooled, as in production.
     rmm::mr::pool_memory_resource mr_pool{mr_cuda, 256_MiB, 512_MiB};
@@ -1088,12 +1094,49 @@ TEST_F(BufferSpillStatistics, NotRecordedWithoutATransition) {
 }
 
 TEST_F(BufferSpillStatistics, NotRecordedWhenFreedOffDevice) {
-    // A buffer that is never needed on device again records nothing. Such a spill was
-    // never paid back, which this statistic does not count.
+    // A buffer that is never needed on device again records no interval. Such a spill
+    // was never paid back, which this statistic does not count.
     auto buffer = allocate(MemoryType::DEVICE);
     buffer = move(std::move(buffer), MemoryType::HOST);
     buffer.reset();
     EXPECT_EQ(samples(), 0u);
+}
+
+// Scope: what share of spilling `buffer-spilled-time` covers.
+
+TEST_F(BufferSpillStatistics, DataThatReturnsIsCountedAsReturned) {
+    auto buffer = allocate(MemoryType::DEVICE, medium);
+    buffer = move(std::move(buffer), MemoryType::HOST);
+    buffer = move(std::move(buffer), MemoryType::DEVICE);
+
+    EXPECT_EQ(value("buffer-spilled-returned-bytes"), static_cast<double>(medium));
+    EXPECT_EQ(samples("buffer-spilled-not-returned-bytes"), 0u);
+}
+
+TEST_F(BufferSpillStatistics, DataFreedOffDeviceIsCountedAsNotReturned) {
+    // The shuffler sends every outgoing chunk from host memory, so this is the normal
+    // end for spilled data rather than a sign of a good or bad spill.
+    auto buffer = allocate(MemoryType::DEVICE, medium);
+    buffer = move(std::move(buffer), MemoryType::HOST);
+    buffer.reset();
+
+    EXPECT_EQ(value("buffer-spilled-not-returned-bytes"), static_cast<double>(medium));
+    EXPECT_EQ(samples("buffer-spilled-returned-bytes"), 0u);
+}
+
+TEST_F(BufferSpillStatistics, ADemotedBufferIsCountedOnce) {
+    if (!pinned_available) {
+        GTEST_SKIP() << "Pinned memory not supported on this system";
+    }
+    // One token follows the data across the demotion, so the bytes are counted once
+    // however many buffers carried them.
+    auto buffer = allocate(MemoryType::DEVICE, medium);
+    buffer = move(std::move(buffer), MemoryType::PINNED_HOST);
+    buffer = move(std::move(buffer), MemoryType::HOST);
+    buffer.reset();
+
+    EXPECT_EQ(samples("buffer-spilled-not-returned-bytes"), 1u);
+    EXPECT_EQ(value("buffer-spilled-not-returned-bytes"), static_cast<double>(medium));
 }
 
 TEST_F(BufferSpillStatistics, NotRecordedWhenEnabledMidInterval) {
@@ -1116,4 +1159,18 @@ TEST_F(BufferSpillStatistics, NotRecordedWhenEnabledMidInterval) {
     EXPECT_THROW(
         std::ignore = disabled_stats->get_stat("buffer-spilled-time"), std::out_of_range
     );
+}
+
+TEST_F(BufferSpillStatistics, AnAdoptedTokenIsFilledIn) {
+    if (!pinned_available) {
+        GTEST_SKIP() << "Pinned memory not supported on this system";
+    }
+    // A caller that spilled the data itself, as cudf-streaming's `table_chunk::copy`
+    // does, hands over a bare token and gets the size and statistics filled in.
+    auto pinned = std::make_unique<rmm::device_buffer>(medium, stream, br->pinned_mr());
+    auto buffer =
+        br->move(std::move(pinned), stream, std::make_shared<SpillTrackToken>());
+    buffer.reset();
+
+    EXPECT_EQ(value("buffer-spilled-not-returned-bytes"), static_cast<double>(medium));
 }

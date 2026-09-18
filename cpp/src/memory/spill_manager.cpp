@@ -68,12 +68,35 @@ void SpillManager::remove_spill_function(SpillFunctionID fid) {
 }
 
 std::size_t SpillManager::spill_unsafe(std::size_t amount) {
+    auto const statistics = br_->statistics();
+    bool const record = statistics->enabled() && amount > 0;
+
     std::size_t spilled{0};
-    for (auto const [_, fid] : spill_function_priorities_) {
+    for (auto const [priority, fid] : spill_function_priorities_) {
         if (spilled >= amount) {
             break;
         }
-        spilled += spill_functions_.at(fid)(amount - spilled);
+        auto const freed = spill_functions_.at(fid)(amount - spilled);
+        spilled += freed;
+        if (record) {
+            // Broken down by priority, since that is what decides which spill function
+            // gets the chance to free the memory and so which selection strategy is the
+            // one actually running.
+            statistics->add_bytes_stat(
+                "spill-freed-bytes-priority" + std::to_string(priority), freed
+            );
+        }
+    }
+
+    // Spilling works in whole buffers, so what it frees rarely matches what was asked
+    // for, and the excess is device memory nobody requested. What was asked for is not
+    // recorded here, since it is the whole outstanding deficit rather than any one
+    // request's demand. `reserve-{memtype}-overbook-bytes` reports that instead.
+    if (record) {
+        statistics->add_bytes_stat("spill-freed-bytes", spilled);
+        statistics->add_bytes_stat(
+            "spill-excess-bytes", spilled > amount ? spilled - amount : 0
+        );
     }
     return spilled;
 }

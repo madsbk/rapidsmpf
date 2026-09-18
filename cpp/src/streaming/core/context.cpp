@@ -40,6 +40,40 @@ std::size_t spill_messages(
     std::map<SpillableMessages::MessageId, ContentDescription> cds =
         spillable_messages.get_content_descriptions();
 
+    // How much there was to choose between. Which message is spilled can only matter in
+    // proportion to how many hold device memory, so this is the denominator for any
+    // claim about the selection order, and the bytes say whether the pool could have
+    // covered `amount` at all.
+    if (auto const statistics = br->statistics(); statistics->enabled()) {
+        std::size_t candidates{0};
+        std::size_t candidate_bytes{0};
+        for (auto const& [_, cd] : cds) {
+            if (!cd.spillable()) {
+                continue;
+            }
+            if (auto const nbytes = cd.content_size(MemoryType::DEVICE); nbytes > 0) {
+                ++candidates;
+                candidate_bytes += nbytes;
+            }
+        }
+        // Split so the pool size is not diluted by the calls that find nothing. Most
+        // calls do: whoever could spill cheaply has usually done so already, and asking
+        // an empty pool is not a small pool.
+        statistics->add_report_entry(
+            "spill-candidates-none",
+            {"spill-candidates-none"},
+            Statistics::Formatter::HitRate
+        );
+        statistics->add_stat("spill-candidates-none", candidates == 0 ? 1 : 0);
+        if (candidates > 0) {
+            statistics->add_report_entry(
+                "spill-candidates", {"spill-candidates"}, Statistics::Formatter::Gauge
+            );
+            statistics->add_stat("spill-candidates", static_cast<double>(candidates));
+            statistics->add_bytes_stat("spill-candidate-bytes", candidate_bytes);
+        }
+    }
+
     // Iterate over each message and attempt to spill until target amount is reached
     std::size_t total_spilled = 0;
     for (auto const& [id, cd] : cds) {

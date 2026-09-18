@@ -5,6 +5,7 @@
 
 
 #include <condition_variable>
+#include <cstddef>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -18,6 +19,7 @@
 #include <rapidsmpf/memory/buffer.hpp>
 #include <rapidsmpf/memory/buffer_resource.hpp>
 #include <rapidsmpf/shuffler/shuffler.hpp>
+#include <rapidsmpf/statistics.hpp>
 #include <rapidsmpf/utils/misc.hpp>
 
 #include "utils.hpp"
@@ -179,4 +181,125 @@ TEST(SpillManager, TrySpillToMakeHeadroomSkipsWhileSpilling) {
     }
     cv.notify_all();
     thd.join();
+}
+
+// Amount: spilling works in whole buffers, so what it frees rarely matches the ask.
+
+namespace {
+
+/// @brief A resource whose only spill function frees `granularity` bytes at a time.
+std::shared_ptr<BufferResource> br_spilling_in_chunks(
+    std::shared_ptr<Statistics> stats, std::size_t granularity, std::size_t available
+) {
+    auto br = BufferResource::create(
+        rmm::mr::get_current_device_resource_ref(),
+        PinnedMemoryDisabled,
+        {{MemoryType::DEVICE, safe_cast<std::int64_t>(available)}},
+        std::nullopt,
+        std::make_shared<StreamPool>(1),
+        std::move(stats)
+    );
+    br->spill_manager().add_spill_function(
+        [granularity, remaining = available](std::size_t amount) mutable -> std::size_t {
+            std::size_t spilled{0};
+            while (spilled < amount && remaining > 0) {
+                auto const chunk = std::min(granularity, remaining);
+                remaining -= chunk;
+                spilled += chunk;
+            }
+            return spilled;
+        },
+        /* priority = */ 0
+    );
+    return br;
+}
+
+}  // namespace
+
+TEST(SpillManager, ExcessIsWhatNobodyAskedFor) {
+    auto stats = Statistics::create();
+    auto br = br_spilling_in_chunks(stats, /* granularity = */ 4_MiB, 64_MiB);
+
+    // Asking for one byte frees a whole buffer.
+    EXPECT_EQ(br->spill_manager().spill(1), 4_MiB);
+
+    EXPECT_EQ(stats->get_stat("spill-freed-bytes").value(), static_cast<double>(4_MiB));
+    EXPECT_EQ(
+        stats->get_stat("spill-excess-bytes").value(), static_cast<double>(4_MiB - 1)
+    );
+}
+
+TEST(SpillManager, NoExcessWhenSpillingFallsShort) {
+    auto stats = Statistics::create();
+    auto br = br_spilling_in_chunks(stats, /* granularity = */ 4_MiB, 8_MiB);
+
+    EXPECT_EQ(br->spill_manager().spill(64_MiB), 8_MiB);
+
+    EXPECT_EQ(stats->get_stat("spill-freed-bytes").value(), static_cast<double>(8_MiB));
+    EXPECT_EQ(stats->get_stat("spill-excess-bytes").value(), 0.0);
+}
+
+TEST(SpillManager, AnExactSpillHasNoExcess) {
+    auto stats = Statistics::create();
+    auto br = br_spilling_in_chunks(stats, /* granularity = */ 4_MiB, 64_MiB);
+
+    EXPECT_EQ(br->spill_manager().spill(4_MiB), 4_MiB);
+
+    EXPECT_EQ(stats->get_stat("spill-excess-bytes").value(), 0.0);
+}
+
+TEST(SpillManager, NothingRecordedWhenNothingIsAskedFor) {
+    // The periodic spill thread asks for zero whenever availability is non-negative,
+    // which is most of the time, and must not flood the statistics.
+    auto stats = Statistics::create();
+    auto br = br_spilling_in_chunks(stats, /* granularity = */ 4_MiB, 64_MiB);
+
+    EXPECT_EQ(br->spill_manager().spill(0), 0u);
+
+    EXPECT_THROW(std::ignore = stats->get_stat("spill-freed-bytes"), std::out_of_range);
+}
+
+TEST(SpillManager, FreedBytesAreBrokenDownByPriority) {
+    // Which priority freed the memory says which selection strategy is the one running,
+    // since a higher priority runs first and may leave the others nothing to do.
+    auto stats = Statistics::create();
+    auto br = br_spilling_in_chunks(stats, /* granularity = */ 4_MiB, 64_MiB);
+
+    // A lower-priority function, which never gets a turn while the first one suffices.
+    bool fallback_called = false;
+    br->spill_manager().add_spill_function(
+        [&fallback_called](std::size_t amount) -> std::size_t {
+            fallback_called = true;
+            return amount;
+        },
+        /* priority = */ -1
+    );
+
+    EXPECT_EQ(br->spill_manager().spill(1_MiB), 4_MiB);
+
+    EXPECT_FALSE(fallback_called);
+    EXPECT_EQ(
+        stats->get_stat("spill-freed-bytes-priority0").value(), static_cast<double>(4_MiB)
+    );
+    EXPECT_THROW(
+        std::ignore = stats->get_stat("spill-freed-bytes-priority-1"), std::out_of_range
+    );
+}
+
+TEST(SpillManager, DemandIsThisReservationsShareOfTheDeficit) {
+    // `reserve_device_memory_and_spill` is a second way to overbook, one that
+    // `reserve-{memtype}-overbook-bytes` does not see, so it reports its own demand.
+    auto stats = Statistics::create();
+    // Nothing is spillable, so the deficit stands and every reservation re-asks for it.
+    auto br = br_spilling_in_chunks(stats, /* granularity = */ 4_MiB, 0);
+
+    std::ignore = br->reserve_device_memory_and_spill(1_MiB, AllowOverbooking::YES);
+    std::ignore = br->reserve_device_memory_and_spill(1_MiB, AllowOverbooking::YES);
+
+    // Two reservations of 1 MiB each demanded 1 MiB each, even though the second saw a
+    // 2 MiB deficit, and neither got anything.
+    auto const demand = stats->get_stat("spill-demand-bytes");
+    EXPECT_EQ(demand.count(), 2u);
+    EXPECT_EQ(demand.value(), static_cast<double>(2_MiB));
+    EXPECT_EQ(stats->get_stat("spill-unmet-bytes").value(), static_cast<double>(2_MiB));
 }
