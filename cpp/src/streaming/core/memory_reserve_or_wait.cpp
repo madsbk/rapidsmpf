@@ -4,6 +4,7 @@
  */
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <ranges>
@@ -60,6 +61,11 @@ void MemoryReserveOrWait::record_stat(std::string_view suffix, double value) con
         entry("wait-timeout-time", Formatter::Duration);
         entry("request-bytes", Formatter::Bytes);
         entry("overbook-bytes", Formatter::Bytes);
+        entry("wait-satisfied-peak-available-bytes", Formatter::Bytes);
+        entry("wait-satisfied-request-bytes", Formatter::Bytes);
+        entry("wait-timeout-peak-available-bytes", Formatter::Bytes);
+        entry("wait-timeout-request-bytes", Formatter::Bytes);
+        entry("wait-timeout-memory-was-available", Formatter::HitRate);
     });
     statistics_->add_stat(stat_prefix_ + std::string{suffix}, value);
 }
@@ -68,12 +74,40 @@ MemoryReserveOrWait::~MemoryReserveOrWait() noexcept {
     coro::sync_wait(shutdown());
 }
 
+void MemoryReserveOrWait::update_extra_headroom_unsafe() {
+    // EXPERIMENT: `RAPIDSMPF_RESERVE_TRIGGERS_SPILLING=0` stops reserve-or-wait from
+    // publishing headroom, so a waiting request no longer drives the spill manager and
+    // one build serves both arms of an A/B. Not for landing.
+    static bool const trigger_enabled = [] {
+        char const* env = std::getenv("RAPIDSMPF_RESERVE_TRIGGERS_SPILLING");
+        return env == nullptr || std::string_view{env} != "0";
+    }();
+    if (!trigger_enabled) {
+        extra_headroom_ = {};
+        return;
+    }
+    // `spill_to_make_headroom()` only considers device memory.
+    if (mem_type_ != MemoryType::DEVICE) {
+        return;
+    }
+    if (reservation_requests_.empty()) {
+        extra_headroom_ = {};
+        return;
+    }
+    // The set is sorted by ascending size, so `begin()` is the smallest pending request.
+    auto const smallest = reservation_requests_.begin()->size;
+    if (extra_headroom_.size() != smallest) {
+        extra_headroom_ = br_->spill_manager().add_extra_headroom(smallest);
+    }
+}
+
 Actor MemoryReserveOrWait::shutdown() {
     // Move the pending requests and joinable periodic task out under the mutex,
     // then release the lock. Both the queue shutdown and the task await can block
     // or suspend, so they must not run while holding the mutex.
     std::unique_lock lock(mutex_);
     auto reservation_requests = std::move(reservation_requests_);
+    extra_headroom_ = {};
     auto periodic_memory_check_task =
         std::exchange(periodic_memory_check_task_, std::nullopt);
     lock.unlock();
@@ -121,6 +155,7 @@ coro::task<MemoryReservation> MemoryReserveOrWait::reserve_or_wait(
         }
     );
     auto const waiting_requests = reservation_requests_.size();
+    update_extra_headroom_unsafe();
 
     // If no periodic memory check task is running, start one.
     std::optional<coro::task<void>> previous_periodic_task;
@@ -293,11 +328,24 @@ coro::task<void> MemoryReserveOrWait::periodic_memory_check() {
             // Find the request with the smallest net_memory_delta that fits
             // into the currently available memory.
             std::unique_lock lock(mutex_);
+
+            // Remember the most memory each still-pending request has seen available,
+            // so both exits below can say how close the request came on its own.
+            // Applied after selection, since the pass that admits a request would
+            // otherwise count towards its own peak and make it trivially equal to the
+            // size it asked for. The set holds a handful of requests at most.
+            auto note_peak = [&] {
+                for (Request const& request : reservation_requests_) {
+                    request.peak_available = std::max(request.peak_available, max_size);
+                }
+            };
+
             auto eligibles = eligible_requests(max_size);
             if (eligibles.empty()) {
                 // Nothing currently fits. Preserve resident data while ordinary
                 // admission waits for a reservation release; the timeout path
                 // below remains responsible for bounded progress.
+                note_peak();
                 continue;  // No eligible requests.
             }
 
@@ -308,11 +356,18 @@ coro::task<void> MemoryReserveOrWait::periodic_memory_check() {
             // Try to reserve memory for the selected request.
             auto [res, _] = br_->reserve(mem_type_, it->size, AllowOverbooking::NO);
             if (res.size() == 0) {
+                note_peak();
                 continue;  // Memory is no longer available.
             }
 
+            // Read before extraction, so it covers only the passes this request
+            // survived rather than the one that admitted it.
+            auto const peak_before_admission = it->peak_available;
+
             // Extract the selected request and push the reservation into its queue.
             Request request = reservation_requests_.extract(it).value();
+            note_peak();
+            update_extra_headroom_unsafe();
             lock.unlock();
             last_reservation_success = Clock::now();
 
@@ -322,6 +377,18 @@ coro::task<void> MemoryReserveOrWait::periodic_memory_check() {
             record_stat(
                 "wait-satisfied-time",
                 Duration{last_reservation_success - request.submitted_at}.count()
+            );
+
+            // How close the request came before the release that admitted it. Read
+            // against `wait-satisfied-request-bytes`: a peak near the request size
+            // means it was nearly satisfiable on its own, so anything freed on its
+            // behalf while it waited bought little.
+            record_stat(
+                "wait-satisfied-peak-available-bytes",
+                static_cast<double>(peak_before_admission)
+            );
+            record_stat(
+                "wait-satisfied-request-bytes", static_cast<double>(request.size)
             );
 
             push_into_queue(request.queue, std::move(res));
@@ -358,6 +425,7 @@ coro::task<void> MemoryReserveOrWait::periodic_memory_check() {
         );
 
         Request request = reservation_requests_.extract(it).value();
+        update_extra_headroom_unsafe();
         lock.unlock();
 
         // Reserve memory and accept a zero-size result if it does not fit into the
@@ -370,6 +438,23 @@ coro::task<void> MemoryReserveOrWait::periodic_memory_check() {
         record_stat("wait-timeout", 1);
         record_stat(
             "wait-timeout-time", Duration{Clock::now() - request.submitted_at}.count()
+        );
+
+        // Whether the memory this request asked for was ever available while it
+        // waited. A hit means the shortage was not absolute and the request lost the
+        // memory to another request or to a competing allocation, so forcing a spill
+        // was not the only way forward. A miss means waiting longer would have
+        // achieved nothing.
+        record_stat(
+            "wait-timeout-peak-available-bytes",
+            static_cast<double>(request.peak_available)
+        );
+        // Recorded alongside the peak so the two can be compared over the same
+        // requests, which `request-bytes` cannot do since it covers every request.
+        record_stat("wait-timeout-request-bytes", static_cast<double>(request.size));
+        record_stat(
+            "wait-timeout-memory-was-available",
+            request.peak_available >= request.size ? 1 : 0
         );
 
         push_into_queue(request.queue, std::move(res));

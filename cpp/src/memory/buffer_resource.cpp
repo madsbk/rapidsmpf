@@ -210,6 +210,17 @@ MemoryReservation BufferResource::reserve_device_memory_and_spill(
     // ask the spill manager to make room for overbooking
     if (ob > 0) {
         auto spilled = spill_manager_.spill(ob);
+
+        // The demand this reservation put on spilling, which is a second way to
+        // overbook alongside `reserve-{memtype}-overbook-bytes`. `ob` is the whole
+        // outstanding deficit, which every reservation made while it stands asks for
+        // again, so only the part this one added counts as its own.
+        auto const demand = std::min(size, ob);
+        statistics_->add_bytes_stat("spill-demand-bytes", demand);
+        statistics_->add_bytes_stat(
+            "spill-unmet-bytes", spilled < demand ? demand - spilled : 0
+        );
+
         RAPIDSMPF_EXPECTS(
             allow_overbooking == AllowOverbooking::YES || spilled >= ob,
             "failed to spill enough memory (reserved: " + format_nbytes(size)
@@ -295,6 +306,12 @@ std::unique_ptr<Buffer> BufferResource::move(
     }
 
     if (is_host_accessible(data->memory_resource())) {
+        if (spill_token != nullptr) {
+            // Filled in here rather than by the caller, which would have to reach for
+            // the size and the statistics that this already holds.
+            spill_token->nbytes = data->size();
+            spill_token->statistics = statistics_->weak_from_this();
+        }
         auto pinned_host_buffer = std::make_unique<HostBuffer>(
             HostBuffer::from_rmm_device_buffer(std::move(data), stream)
         );
@@ -327,6 +344,8 @@ std::unique_ptr<Buffer> BufferResource::move(
         statistics_->add_duration_stat(
             "buffer-spilled-time", Duration{Clock::now() - token->since}
         );
+        statistics_->add_bytes_stat("buffer-spilled-returned-bytes", token->nbytes);
+        token->returned = true;
         token.reset();
     }
 
@@ -339,7 +358,10 @@ std::unique_ptr<Buffer> BufferResource::move(
         // Not opened while disabled, since enabling later would close an interval
         // whose start was never observed.
         if (tracked && statistics_->enabled()) {
-            ret->spill_track_token_ = std::make_shared<SpillTrackToken>();
+            auto token_out = std::make_shared<SpillTrackToken>();
+            token_out->nbytes = nbytes;
+            token_out->statistics = statistics_->weak_from_this();
+            ret->spill_track_token_ = std::move(token_out);
         }
     } else {
         ret->spill_track_token_ = std::move(token);

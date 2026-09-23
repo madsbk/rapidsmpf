@@ -510,7 +510,8 @@ class BufferResource : public std::enable_shared_from_this<BufferResource> {
      * @param stream CUDA stream associated with the new Buffer. Use or synchronize with
      * this stream when operating on the Buffer.
      * @param spill_token The spill token the new Buffer adopts, for a caller that
-     * spilled the data. Must be null for device memory.
+     * spilled the data. Must be null for device memory. A default-constructed token
+     * is enough, its size and statistics are filled in here.
      * @return Unique pointer to the resulting Buffer.
      *
      * @throws std::invalid_argument If @p spill_token is set and @p data is not

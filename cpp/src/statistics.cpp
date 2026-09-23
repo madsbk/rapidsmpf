@@ -168,6 +168,15 @@ Statistics::Stat Statistics::Stat::merge(Stat const& other) const {
     return Stat(count_ + other.count_, value_ + other.value_, std::max(max_, other.max_));
 }
 
+SpillTrackToken::~SpillTrackToken() {
+    if (returned) {
+        return;
+    }
+    if (auto const stats = statistics.lock()) {
+        stats->add_bytes_stat("buffer-spilled-not-returned-bytes", nbytes);
+    }
+}
+
 Statistics::~Statistics() noexcept {
     StreamOrderedTiming::cancel_inflight_timings(this);
 }

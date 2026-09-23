@@ -7,7 +7,6 @@
 #include <concepts>
 #include <cstddef>
 #include <filesystem>
-#include <functional>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -41,8 +40,9 @@ class Statistics;
  *  - Carried along by further relocations, so one token follows the data.
  *  - Closed when a relocation allocates a device buffer again, recording the interval.
  *
- * A copy that keeps its source frees nothing and opens no token, and data freed while
- * spilled is never closed and never recorded.
+ * A copy that keeps its source frees nothing and opens no token. Data freed while
+ * spilled is never closed, and is counted as never returned when the token is
+ * destroyed.
  *
  * **Stream ordering.** The interval is not stream ordered. Both ends are taken at the
  * host calls that move `BufferResource::memory_available()`, which is what reservations
@@ -52,6 +52,25 @@ class Statistics;
 struct SpillTrackToken {
     /// @brief When the spilled buffer was freed.
     Clock::time_point since{Clock::now()};
+
+    /// @brief The bytes the spill released on the device.
+    std::size_t nbytes{0};
+
+    /// @brief Where the outcome is reported, empty when nothing tracks it.
+    std::weak_ptr<Statistics> statistics{};
+
+    /// @brief Whether the data made it back to device memory.
+    bool returned{false};
+
+    /**
+     * @brief Records `buffer-spilled-not-returned-bytes` unless the data returned.
+     *
+     * Data that ends its life off device was either consumed from host memory, which
+     * a shuffle does for every outgoing chunk, or still spilled when the run ended.
+     * Either way `buffer-spilled-time` says nothing about it, so it is counted here
+     * to give that statistic a denominator.
+     */
+    ~SpillTrackToken();
 };
 
 class StreamOrderedTiming;
