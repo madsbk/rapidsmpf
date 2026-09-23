@@ -5,7 +5,9 @@
 
 #pragma once
 
+#include <atomic>
 #include <compare>
+#include <cstdint>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -140,6 +142,31 @@ class SpillManager {
      */
     HeadroomResult spill_to_make_headroom(std::int64_t headroom = 0);
 
+    /**
+     * @brief Whether a spill is executing right now.
+     *
+     * Reads an atomic counter rather than the spill lock, so an observer never contends
+     * with the spiller and never delays it.
+     *
+     * @return True while at least one spill function is running.
+     *
+     * @see spill_generation()
+     */
+    [[nodiscard]] bool spilling_now() const noexcept;
+
+    /**
+     * @brief Number of spills that have completed.
+     *
+     * Increments once per `spill()` or `spill_to_make_headroom()` call that asked for a
+     * non-zero amount, after its spill functions have returned. A caller that samples
+     * this before and after a wait can tell whether memory was freed while it waited,
+     * which `spilling_now()` alone cannot express for a spill that starts and finishes
+     * between two samples.
+     *
+     * @return A monotonically increasing count.
+     */
+    [[nodiscard]] std::uint64_t spill_generation() const noexcept;
+
   private:
     /**
      * @brief Spills memory without locking. The caller must hold `mutex_`.
@@ -155,6 +182,11 @@ class SpillManager {
     std::map<SpillFunctionID, SpillFunction> spill_functions_;
     std::multimap<int, SpillFunctionID, std::greater<>> spill_function_priorities_;
     std::optional<detail::PausableThreadLoop> periodic_spill_thread_;
+
+    // Published for `spilling_now()` and `spill_generation()`, which read them without
+    // taking `mutex_`.
+    std::atomic<int> spills_in_flight_{0};
+    std::atomic<std::uint64_t> spill_generation_{0};
 };
 
 

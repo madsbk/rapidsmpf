@@ -312,6 +312,12 @@ class MemoryReserveOrWait {
     std::shared_ptr<CoroThreadPoolExecutor> executor_;
     std::shared_ptr<BufferResource> br_;
     Duration const timeout_;
+    /// @brief How far past `timeout_` a request may wait on spilling in total.
+    ///
+    /// Spilling progress, not this cap, is what normally ends the wait. The cap only
+    /// catches a spill that never finishes, which would otherwise hold every waiting
+    /// request forever instead of letting them overbook.
+    Duration const spill_wait_cap_;
     std::shared_ptr<Statistics> statistics_;
     std::string const stat_prefix_;
     mutable std::once_flag report_entries_once_;

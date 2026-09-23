@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <ranges>
 #include <stdexcept>
 #include <string>
@@ -33,6 +34,7 @@ MemoryReserveOrWait::MemoryReserveOrWait(
       executor_{std::move(executor)},
       br_{std::move(br)},
       timeout_{options.get<Duration>("memory_reserve_timeout", parse_duration)},
+      spill_wait_cap_{10 * timeout_},
       stat_prefix_{"reserve-" + to_lower(to_string(mem_type)) + "-"} {
     RAPIDSMPF_EXPECTS(executor_ != nullptr, "executor cannot be NULL");
     RAPIDSMPF_EXPECTS(br_ != nullptr, "br cannot be NULL");
@@ -60,6 +62,9 @@ void MemoryReserveOrWait::record_stat(std::string_view suffix, double value) con
         entry("wait-timeout-time", Formatter::Duration);
         entry("request-bytes", Formatter::Bytes);
         entry("overbook-bytes", Formatter::Bytes);
+        entry("wait-spill-extended", Formatter::HitRate);
+        entry("wait-spill-rescued", Formatter::HitRate);
+        entry("wait-spill-extension-time", Formatter::Duration);
     });
     statistics_->add_stat(stat_prefix_ + std::string{suffix}, value);
 }
@@ -270,6 +275,24 @@ coro::task<void> MemoryReserveOrWait::periodic_memory_check() {
 
     while (true) {
         auto last_reservation_success = Clock::now();
+        // When the deadline was first extended because a spill was running, so both
+        // exits below can say whether the extension paid for itself. Reset with the
+        // deadline, since each wait window is judged on its own.
+        std::optional<Clock::time_point> extended_at;
+        // Set while a spill is being waited on, so that when the spill ends the loop
+        // takes one more admission pass instead of timing out on the memory it just
+        // waited for.
+        bool recheck_after_spill{false};
+        // Set once a completed spill failed to free memory for this window. Final until
+        // the next admission: spills keep coming back to back under pressure, and
+        // letting the next one re-open the wait would ride the cap on every request.
+        bool spill_stalled{false};
+        // Spill count and available memory at the last point progress was judged, so a
+        // completing spill can be asked whether it actually freed anything. Signed,
+        // since while others have overbooked, a spill can make progress and still leave
+        // the memory available below zero.
+        std::uint64_t extend_generation{0};
+        std::int64_t extend_available{0};
         while (true) {
             // Exit if no more pending requests remain.
             {
@@ -282,10 +305,69 @@ coro::task<void> MemoryReserveOrWait::periodic_memory_check() {
             }
             periodic_memory_check_counter_.fetch_add(1, std::memory_order_acq_rel);
             co_await executor_->yield();
-            if (Clock::now() - last_reservation_success > timeout_) {
-                // This is the only way out of the while-loop that doesn't shutdown
-                // the periodic memory check.
-                break;
+            if (auto const now = Clock::now(); now - last_reservation_success > timeout_)
+            {
+                // A spill in flight is memory about to arrive, and a spill takes longer
+                // than the timeout for any partition of a useful size. Giving up now
+                // overbooks memory that is already being freed. Nothing is spilled from
+                // here: this only declines to give up during someone else's spill.
+                auto& spill_manager = br_->spill_manager();
+                if (extended_at.has_value() && !spill_stalled) {
+                    if (auto const generation = spill_manager.spill_generation();
+                        generation != extend_generation)
+                    {
+                        // A spill finished while this request waited. Carry on only
+                        // while spilling still frees memory. Under pressure the spiller
+                        // is busy nearly all the time, and waiting on one with nothing
+                        // left to give would hold every request for the whole cap.
+                        // Judging progress rather than elapsed time also keeps this
+                        // correct when a spill is slow, such as one going to disk, or
+                        // simply faster or slower on another machine. Judged whether or
+                        // not another spill has started since, which is the usual case.
+                        auto const available =
+                            br_->memory_available_for_reservation(mem_type_);
+                        spill_stalled = available <= extend_available;
+                        extend_generation = generation;
+                        extend_available = available;
+                    }
+                }
+                // The spill manager only frees device memory. A device spill moves
+                // data into host memory rather than out of it, so other memory types
+                // have nothing to wait for.
+                bool const keep_waiting =
+                    mem_type_ == MemoryType::DEVICE && !spill_stalled
+                    && now - last_reservation_success <= timeout_ + spill_wait_cap_
+                    && spill_manager.spilling_now();
+
+                if (keep_waiting) {
+                    if (!extended_at.has_value()) {
+                        extended_at = now;
+                        extend_generation = spill_manager.spill_generation();
+                        extend_available =
+                            br_->memory_available_for_reservation(mem_type_);
+                    }
+                    // Carry on to the admission check below, since a release can make
+                    // room while the spill is still running.
+                    recheck_after_spill = true;
+                } else if (recheck_after_spill) {
+                    // The spill finished. Fall through to one admission pass, otherwise
+                    // the freed memory is discarded and the request overbooks for it.
+                    recheck_after_spill = false;
+                } else if (extended_at.has_value()) {
+                    // Extended and still timed out, so the wait was spent for nothing.
+                    record_stat("wait-spill-extended", 1);
+                    record_stat("wait-spill-rescued", 0);
+                    record_stat(
+                        "wait-spill-extension-time", Duration{now - *extended_at}.count()
+                    );
+
+                    // This is the only way out of the while-loop that doesn't shutdown
+                    // the periodic memory check.
+                    break;
+                } else {
+                    record_stat("wait-spill-extended", 0);
+                    break;
+                }
             }
             auto const max_size = memory_available();
 
@@ -314,6 +396,20 @@ coro::task<void> MemoryReserveOrWait::periodic_memory_check() {
             Request request = reservation_requests_.extract(it).value();
             lock.unlock();
             last_reservation_success = Clock::now();
+            spill_stalled = false;
+            recheck_after_spill = false;
+
+            if (extended_at.has_value()) {
+                // Admitted during an extension, which is the case the extension exists
+                // for: without it this request would have overbooked instead.
+                record_stat("wait-spill-extended", 1);
+                record_stat("wait-spill-rescued", 1);
+                record_stat(
+                    "wait-spill-extension-time",
+                    Duration{last_reservation_success - *extended_at}.count()
+                );
+                extended_at.reset();
+            }
 
             // Satisfied: a reservation release made room for this request, so it
             // did not reach the timeout.
