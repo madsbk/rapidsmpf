@@ -81,6 +81,11 @@ void MemoryReserveOrWait::record_stat(std::string_view suffix, double value) con
         entry("wait-spill-extended", Formatter::HitRate);
         entry("wait-spill-rescued", Formatter::HitRate);
         entry("wait-spill-extension-time", Formatter::Duration);
+        entry("wait-satisfied-peak-available-bytes", Formatter::Bytes);
+        entry("wait-satisfied-request-bytes", Formatter::Bytes);
+        entry("wait-timeout-peak-available-bytes", Formatter::Bytes);
+        entry("wait-timeout-request-bytes", Formatter::Bytes);
+        entry("wait-timeout-memory-was-available", Formatter::HitRate);
     });
     statistics_->add_stat(stat_prefix_ + std::string{suffix}, value);
 }
@@ -391,11 +396,23 @@ coro::task<void> MemoryReserveOrWait::periodic_memory_check() {
             // Find the request with the smallest net_memory_delta that fits
             // into the currently available memory.
             std::unique_lock lock(mutex_);
+
+            // Remember the most memory each still-pending request has seen available,
+            // so both exits can say how close the request came on its own. Applied
+            // after selection, so the pass that admits a request does not count towards
+            // its own peak.
+            auto note_peak = [&] {
+                for (Request const& request : reservation_requests_) {
+                    request.peak_available = std::max(request.peak_available, max_size);
+                }
+            };
+
             auto eligibles = eligible_requests(max_size);
             if (eligibles.empty()) {
                 // Nothing currently fits. Preserve resident data while ordinary
                 // admission waits for a reservation release; the timeout path
                 // below remains responsible for bounded progress.
+                note_peak();
                 continue;  // No eligible requests.
             }
 
@@ -406,11 +423,17 @@ coro::task<void> MemoryReserveOrWait::periodic_memory_check() {
             // Try to reserve memory for the selected request.
             auto [res, _] = br_->reserve(mem_type_, it->size, AllowOverbooking::NO);
             if (res.size() == 0) {
+                note_peak();
                 continue;  // Memory is no longer available.
             }
 
+            // Read before extraction, so it covers only the passes this request
+            // survived rather than the one that admitted it.
+            auto const peak_before_admission = it->peak_available;
+
             // Extract the selected request and push the reservation into its queue.
             Request request = reservation_requests_.extract(it).value();
+            note_peak();
             lock.unlock();
             last_reservation_success = Clock::now();
             spill_stalled = false;
@@ -434,6 +457,13 @@ coro::task<void> MemoryReserveOrWait::periodic_memory_check() {
             record_stat(
                 "wait-satisfied-time",
                 Duration{last_reservation_success - request.submitted_at}.count()
+            );
+            record_stat(
+                "wait-satisfied-peak-available-bytes",
+                static_cast<double>(peak_before_admission)
+            );
+            record_stat(
+                "wait-satisfied-request-bytes", static_cast<double>(request.size)
             );
 
             push_into_queue(request.queue, std::move(res));
@@ -482,6 +512,17 @@ coro::task<void> MemoryReserveOrWait::periodic_memory_check() {
         record_stat("wait-timeout", 1);
         record_stat(
             "wait-timeout-time", Duration{Clock::now() - request.submitted_at}.count()
+        );
+        // Whether the memory this request asked for was ever available while it
+        // waited, with the two sides of that comparison over the same requests.
+        record_stat(
+            "wait-timeout-peak-available-bytes",
+            static_cast<double>(request.peak_available)
+        );
+        record_stat("wait-timeout-request-bytes", static_cast<double>(request.size));
+        record_stat(
+            "wait-timeout-memory-was-available",
+            request.peak_available >= request.size ? 1 : 0
         );
 
         push_into_queue(request.queue, std::move(res));

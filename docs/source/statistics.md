@@ -8,6 +8,9 @@ This table gives an overview of the different statistics collected.
 | `alloc-{memtype}` | Bytes allocated via `BufferResource::allocate()`, broken down by memory type (`device`, `pinned_host`, `host`). Shows total bytes, total time, allocation throughput, and average stream delay. |
 | `copy-{src}-to-{dst}` | Amount of data copied between memory types by RapidsMPF. `{src}` and `{dst}` are `device`, `pinned_host`, or `host`. Shows total bytes, total copy time, throughput, and average stream delay (time between CPU submission and GPU execution of the copy). |
 | `buffer-spilled-time` | How long spilled data remains spilled until unspilled back into device memory. |
+| `spill-freed-bytes` | Device memory the spill manager actually freed. |
+| `spill-freed-bytes-priority{N}` | The same, broken down by the priority of the spill function that freed it. |
+| `spill-excess-bytes` | Device memory freed beyond what was asked for. Spilling works in whole buffers, so a small request can free a large buffer. |
 | `event-loop-total` | Time spent in in the background `ProgressThread` event-loop. |
 | `recv-into-host-memory` | Data received directly into host memory rather than device memory, due to memory pressure at receive time. |
 | `reserve-{memtype}-wait-avoided` | Reservation requests that `MemoryReserveOrWait` satisfied at once, over all requests. A miss means the request had to wait. |
@@ -17,6 +20,11 @@ This table gives an overview of the different statistics collected.
 | `reserve-{memtype}-wait-spill-extended` | Waiting requests that reached `memory_reserve_timeout` with a spill in flight and so extended their deadline, over all requests that reached the timeout. A miss means nothing was spilling and the timeout stood. |
 | `reserve-{memtype}-wait-spill-rescued` | Extended requests that a completing spill then admitted, over all extended requests. A miss means the request extended its deadline and timed out anyway. |
 | `reserve-{memtype}-wait-spill-extension-time` | Time requests spent waiting beyond `memory_reserve_timeout` for a spill to land. |
+| `reserve-{memtype}-wait-satisfied-peak-available-bytes` | The most memory seen available while a request waited, over the requests later admitted, excluding the pass that admitted them. |
+| `reserve-{memtype}-wait-satisfied-request-bytes` | What those requests asked for, over the same requests as the peak above. |
+| `reserve-{memtype}-wait-timeout-peak-available-bytes` | The most memory seen available while a timed-out request waited. |
+| `reserve-{memtype}-wait-timeout-request-bytes` | What the timed-out requests asked for, over the same requests as the peak above. |
+| `reserve-{memtype}-wait-timeout-memory-was-available` | Timed-out requests whose requested size was available at some point while they waited, over all timed-out requests. |
 | `reserve-{memtype}-waiting-requests` | Requests waiting concurrently. Recorded each time a request starts waiting, not sampled over time, so the maximum is exact while the mean is the queue depth seen when a request starts waiting. |
 | `reserve-{memtype}-request-bytes` | Bytes requested from `reserve_or_wait()`. |
 | `reserve-{memtype}-overbook-bytes` | Bytes by which `reserve_or_wait_or_overbook()` exceeded the memory limit after the timeout, counting only what each request added rather than the total outstanding deficit. |

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <utility>
 
 #include <rapidsmpf/memory/buffer_resource.hpp>
@@ -92,12 +93,32 @@ std::size_t SpillManager::spill_unsafe(std::size_t amount) {
     spills_in_flight_.fetch_add(1, std::memory_order_release);
     InFlightGuard const in_flight{this};
 
+    auto const statistics = br_->statistics();
+    bool const record = statistics->enabled();
+
     std::size_t spilled{0};
-    for (auto const [_, fid] : spill_function_priorities_) {
+    for (auto const [priority, fid] : spill_function_priorities_) {
         if (spilled >= amount) {
             break;
         }
-        spilled += spill_functions_.at(fid)(amount - spilled);
+        auto const freed = spill_functions_.at(fid)(amount - spilled);
+        spilled += freed;
+        if (record) {
+            // By priority, since that decides which spill function gets the chance to
+            // free the memory.
+            statistics->add_bytes_stat(
+                "spill-freed-bytes-priority" + std::to_string(priority), freed
+            );
+        }
+    }
+
+    // Spilling works in whole buffers, so what it frees rarely matches what was asked
+    // for, and the excess is device memory nobody requested.
+    if (record) {
+        statistics->add_bytes_stat("spill-freed-bytes", spilled);
+        statistics->add_bytes_stat(
+            "spill-excess-bytes", spilled > amount ? spilled - amount : 0
+        );
     }
     return spilled;
 }
