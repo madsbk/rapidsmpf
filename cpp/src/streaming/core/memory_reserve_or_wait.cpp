@@ -4,6 +4,7 @@
  */
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -23,6 +24,21 @@
 #include <rapidsmpf/utils/string.hpp>
 
 namespace rapidsmpf::streaming {
+
+namespace {
+
+// EXPERIMENT, not for landing: `RAPIDSMPF_RESERVE_WAIT_FOR_SPILL=0` turns off waiting
+// for an in-flight spill, which leaves the reservation path as it is on `main`, so one
+// build serves both arms of an A/B.
+bool wait_for_spill_enabled() {
+    static bool const enabled = [] {
+        char const* env = std::getenv("RAPIDSMPF_RESERVE_WAIT_FOR_SPILL");
+        return env == nullptr || std::string_view{env} != "0";
+    }();
+    return enabled;
+}
+
+}  // namespace
 
 MemoryReserveOrWait::MemoryReserveOrWait(
     config::Options options,
@@ -335,7 +351,8 @@ coro::task<void> MemoryReserveOrWait::periodic_memory_check() {
                 // data into host memory rather than out of it, so other memory types
                 // have nothing to wait for.
                 bool const keep_waiting =
-                    mem_type_ == MemoryType::DEVICE && !spill_stalled
+                    wait_for_spill_enabled() && mem_type_ == MemoryType::DEVICE
+                    && !spill_stalled
                     && now - last_reservation_success <= timeout_ + spill_wait_cap_
                     && spill_manager.spilling_now();
 
