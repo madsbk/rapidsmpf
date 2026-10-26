@@ -257,8 +257,7 @@ Shuffler::Shuffler(
     PartID total_num_partitions,
     BufferResource* br,
     FinishedCallback&& finished_callback,
-    PartitionOwner partition_owner_fn,
-    std::unique_ptr<communicator::MetadataPayloadExchange> mpe
+    PartitionOwner partition_owner_fn
 )
     : total_num_partitions{total_num_partitions},
       partition_owner{std::move(partition_owner_fn)},
@@ -272,18 +271,15 @@ Shuffler::Shuffler(
           RAPIDSMPF_EXPECTS(comm != nullptr, "the communicator pointer cannot be NULL");
           return std::move(comm);
       }()},
-      mpe_{
-          mpe ? std::move(mpe)
-              : std::make_unique<communicator::TagMetadataPayloadExchange>(
-                    comm_,
-                    op_id,
-                    [br](std::size_t size, AllocationMode mode) {
-                        return allocate_receive_buffer(br, size, mode);
-                    },
-                    br->memory_reserve_timeout(),
-                    br
-                )
-      },
+      mpe_{std::make_unique<communicator::TagMetadataPayloadExchange>(
+          comm_,
+          op_id,
+          [br](std::size_t size, AllocationMode mode) {
+              return allocate_receive_buffer(br, size, mode);
+          },
+          br->memory_reserve_timeout(),
+          br
+      )},
       local_partitions_{local_partitions(comm_, total_num_partitions, partition_owner)},
       finish_counter_{comm_->nranks(), safe_cast<PartID>(local_partitions_.size())},
       outbound_chunk_counter_(safe_cast<std::size_t>(comm_->nranks()), 0),
